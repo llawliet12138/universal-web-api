@@ -2,15 +2,46 @@
   <img src="./static/images/logo.svg" alt="Universal Web API logo" width="160">
 </p>
 
-# Universal Web API
+# Universal Web API（ChatGPT Thread Bridge Fork）
 
 📖 文档 • [English](./README.md) • [简体中文](./README.zh-CN.md)
 
-**Universal Web API** 是一个专为开发者设计的**本地 API 桥接调试工具**。它能够将您在本地浏览器中已登录并正常使用的 AI 网页端服务（如 ChatGPT, DeepSeek, Claude, Gemini 等）转换为本地标准的 OpenAI/Anthropic 兼容接口。
+**仓库定位**：本仓库是上游项目 [lumingya/universal-web-api](https://github.com/lumingya/universal-web-api) 的 Fork。上游项目提供通用的 AI 网页转 API、标签页池和网页自动化能力；**本 Fork 在此基础上新增了 ChatGPT 真实网页线程桥接、终端客户端和 Obsidian 专用接入方式**。
 
-该项目致力于帮助个人开发者在本地进行**工作流编排、客户端集成测试与个人办公自动化**，无需将 API 密钥暴露给第三方，确保数据隐私与网络安全。
+下文会明确标注“上游原项目保留能力”和“本 Fork 新增功能”。除明确列入“本 Fork 新增”的内容外，其余通用能力均来自或继承自上游项目。
 
 > ⚠️ **合规与安全申明**：本工具仅作为一个本地自动化辅助桥接器，在用户本地系统运行。它**不具备且不提供**任何绕过目标网站身份验证（登录）、破解安全机制（如人机验证）或逆向解密接口的功能。用户需自行在受控浏览器中登录合法账号。请勿将本工具用于高频自动化请求或任何商业用途。
+
+---
+
+## 本 Fork 与上游项目的关系
+
+### 上游原项目保留能力
+
+本 Fork 完整保留上游项目的通用能力，包括：
+
+- 将 ChatGPT、Claude、Gemini、DeepSeek 等已登录网页转换为 OpenAI/Anthropic 兼容 API。
+- 受控 Chromium 浏览器、标签页池、域名/固定标签页/精确 URL 路由。
+- 网络流与 DOM 双通道响应解析、多模态提取、附件上传和 Tool Calling。
+- Dashboard、站点预设、请求监控和网页工作流配置。
+
+### 本 Fork 新增功能
+
+以下内容由本 Fork 新增，**上游原项目不包含这些功能**：
+
+| 本 Fork 新增项 | 作用 | 主要文件/接口 |
+| :--- | :--- | :--- |
+| **ChatGPT 网页线程桥接** | 枚举侧边栏会话、按真实 thread ID 继续或新建网页会话 | `app/services/chatgpt_threads.py` |
+| **线程专用 OpenAI API** | 把指定 `chatgpt.com/c/<thread-id>` 暴露为 OpenAI 兼容端点 | `/api/chatgpt/threads/...` |
+| **简化兼容 API** | 为终端和轻量客户端提供简化请求/响应格式 | `/threads`、`/thread/new`、`/thread/{id}/chat` |
+| **终端客户端** | 无需回到网页即可选择、新建、切换和继续网页会话 | `chatgpt_cli.py` |
+| **Obsidian 接入方式** | 以每个真实网页线程为独立 OpenAI Base URL | `/api/chatgpt/threads/<id>/v1` |
+| **线程安全边界** | 未登录快速返回 401、错误线程返回 404、续聊只发送最后一条 `user` 消息 | `app/api/chatgpt_thread_routes.py` |
+| **macOS 启动修复** | 普通 Chrome 已运行时仍创建独立受控实例；调试端口仅监听本机 | `start.py` |
+| **Fork 更新保护** | 默认关闭上游自动更新，避免新增功能被上游发布包覆盖 | `.env.example`、`start.py` |
+| **新增验证体系** | 线程服务、API、CLI、浏览器启动与安全边界测试 | `tests/test_*` |
+
+> 上游仓库：[lumingya/universal-web-api](https://github.com/lumingya/universal-web-api)；本 Fork：[prestige12138/universal-web-api](https://github.com/prestige12138/universal-web-api)。
 
 ---
 
@@ -19,6 +50,8 @@
 ```mermaid
 graph TD
     User([客户端/用户]) -->|OpenAI/Anthropic/Codex API| Route[1. 接口与路由层 app/api]
+    Route -->|本 Fork: 真实 thread ID| ThreadBridge[ChatGPT 网页线程桥接 app/services/chatgpt_threads]
+    ThreadBridge -->|复用/创建指定会话标签页| TabPool
     Route -->|会话分发/并发调度| TabPool[2. 标签页池与生命周期 app/core/tab_pool]
     Route -->|解析函数调用请求| ToolCall[5. 函数调用兼容层 app/services/tool_calling]
     TabPool -->|网页驱动/低熵控制| Browser[3. 网页自动化与执行引擎 app/core/workflow]
@@ -37,7 +70,7 @@ graph TD
 
 ---
 
-## 🌟 项目亮点
+## 🌟 原项目核心能力（本 Fork 保留）
 
 *   **⚡ 零配置、标准兼容**：提供标准 OpenAI 兼容（包括 `/v1/chat/completions` 与 `/v1/models`），并提供面向 Claude Code/Codex 等第三方编程工具的实验性兼容接入（如针对 Claude Code 的 `/v1/messages` 连通性测试，以及针对 Codex 插件的 `/v1/responses` 专用端点）。
 *   **🛠️ 本地受控浏览器驱动**：基于 DrissionPage 库对本地 Chromium 内核浏览器（Chrome / Edge 等）进行轻量自动化控制，数据完全留存在本地，端到端隐私安全。
@@ -59,7 +92,11 @@ graph TD
 
 ### 安装启动步骤
 
-1. **下载解压**：从 [Releases](../../releases) 下载最新压缩包，并解压到**无中文路径**的本地目录。
+1. **克隆本 Fork**：上游 Releases 不包含本 Fork 新增功能，请使用：
+   ```bash
+   git clone https://github.com/prestige12138/universal-web-api.git
+   cd universal-web-api
+   ```
 2. **一键启动**：
    * **Windows**：双击运行根目录下的 **`start.bat`**。
    * **macOS / Linux**：在终端执行 **`python3 start.py`**。
@@ -71,7 +108,7 @@ graph TD
 
 ---
 
-## 💬 继续 ChatGPT 网页会话
+## 本 Fork 新增：ChatGPT 网页线程桥接
 
 线程桥接功能可以列出 ChatGPT 网页侧边栏中的近期会话，并让终端或 OpenAI 兼容客户端继续指定的真实网页会话。消息和回答会保留在 `https://chatgpt.com/c/<thread-id>` 中。
 

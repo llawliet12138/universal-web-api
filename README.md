@@ -2,15 +2,46 @@
   <img src="./static/images/logo.svg" alt="Universal Web API logo" width="160">
 </p>
 
-# Universal Web API
+# Universal Web API (ChatGPT Thread Bridge Fork)
 
 📖 Documentation • [English](./README.md) • [简体中文](./README.zh-CN.md)
 
-**Universal Web API** is a **local API bridge & debugging tool** designed for developers. It converts AI web services (e.g., ChatGPT, DeepSeek, Claude, Gemini) logged in your local browser into local standard OpenAI/Anthropic-compatible APIs.
+**Repository status**: This repository is a fork of [lumingya/universal-web-api](https://github.com/lumingya/universal-web-api). The upstream project provides the general web-to-API, tab-pool, and browser-automation foundation. **This fork adds persistent ChatGPT web-thread routing, a terminal client, and a dedicated Obsidian integration.**
 
-This project is dedicated to helping developers perform **workflow orchestration, client integration testing, and personal office automation locally**, ensuring data privacy and security without exposing API keys to third parties.
+The documentation below explicitly separates retained upstream capabilities from features added by this fork. Unless a capability is listed as a fork addition, it comes from or is inherited from the upstream project.
 
 > ⚠️ **Compliance & Security Statement**: This tool runs entirely on the user's local system as a bridge helper. It **does not** provide any functionality to bypass authentication (login), crack security defenses (such as captcha solvers), or reverse-engineer encrypted APIs. Users must log into their own valid accounts in the controlled browser. Do not use this tool for high-frequency automated requests or commercial purposes.
+
+---
+
+## This Fork and the Upstream Project
+
+### Retained Upstream Capabilities
+
+This fork retains the upstream project's general-purpose functionality:
+
+- OpenAI/Anthropic-compatible APIs backed by logged-in ChatGPT, Claude, Gemini, DeepSeek, and other web apps.
+- Controlled Chromium automation, tab pooling, and domain/fixed-tab/exact-URL routing.
+- Network and DOM stream parsing, multimodal extraction, attachment upload, and tool calling.
+- Dashboard, site presets, request monitoring, and configurable browser workflows.
+
+### Features Added by This Fork
+
+The following capabilities were added by this fork and **are not part of the upstream project**:
+
+| Fork addition | Purpose | Main file/endpoint |
+| :--- | :--- | :--- |
+| **ChatGPT Web Thread Bridge** | Lists sidebar conversations and continues or creates real web threads by thread ID | `app/services/chatgpt_threads.py` |
+| **Thread-specific OpenAI API** | Exposes a selected `chatgpt.com/c/<thread-id>` as an OpenAI-compatible endpoint | `/api/chatgpt/threads/...` |
+| **Simplified compatibility API** | Lightweight request/response format for terminal clients | `/threads`, `/thread/new`, `/thread/{id}/chat` |
+| **Terminal client** | Select, create, switch, and continue web conversations without returning to the site | `chatgpt_cli.py` |
+| **Obsidian integration** | Uses each real web thread as an independent OpenAI Base URL | `/api/chatgpt/threads/<id>/v1` |
+| **Thread safety checks** | Fast 401 for logged-out sessions, 404 for wrong threads, and latest-user-message-only continuation | `app/api/chatgpt_thread_routes.py` |
+| **macOS launch fix** | Starts a separate controlled Chrome instance and binds debugging to localhost | `start.py` |
+| **Fork update protection** | Disables upstream auto-update by default so fork changes are not overwritten | `.env.example`, `start.py` |
+| **Additional verification** | Tests for thread services, APIs, CLI, browser startup, and security boundaries | `tests/test_*` |
+
+> Upstream: [lumingya/universal-web-api](https://github.com/lumingya/universal-web-api). This fork: [prestige12138/universal-web-api](https://github.com/prestige12138/universal-web-api).
 
 ---
 
@@ -19,6 +50,8 @@ This project is dedicated to helping developers perform **workflow orchestration
 ```mermaid
 graph TD
     User([Client/User]) -->|OpenAI/Anthropic/Codex API| Route[1. API & Routing Layer app/api]
+    Route -->|This fork: real thread ID| ThreadBridge[ChatGPT Web Thread Bridge app/services/chatgpt_threads]
+    ThreadBridge -->|Reuse/create selected conversation tab| TabPool
     Route -->|Session Dispatch/Concurrency| TabPool[2. Tab Pool & Lifecycle app/core/tab_pool]
     Route -->|Parse Tool Request| ToolCall[5. Tool Calling Adapter app/services/tool_calling]
     TabPool -->|Browser Control/Anti-detection| Browser[3. Automation & Workflow Engine app/core/workflow]
@@ -37,7 +70,7 @@ graph TD
 
 ---
 
-## 🌟 Highlights
+## 🌟 Upstream Core Capabilities Retained by This Fork
 
 *   **⚡ Zero-config Standard Compatibility**: Fully compatible with OpenAI standard API (including `/v1/chat/completions` and `/v1/models`) with experimental compatibility support for third-party developer tools (such as `/v1/messages` connectivity testing for Claude Code and `/v1/responses` endpoint for Codex plugins).
 *   **🛠️ Local Controlled Browser Drive**: Lightweight automation of Chromium-based browsers (Chrome / Edge, etc.) using DrissionPage. All data stays local for end-to-end privacy.
@@ -59,7 +92,11 @@ graph TD
 
 ### Setup Steps
 
-1. **Download & Extract**: Download the latest release from [Releases](../../releases) and extract it to a path **without non-ASCII (e.g. Chinese) characters**.
+1. **Clone this fork**: Upstream releases do not contain the additions documented above. Use:
+   ```bash
+   git clone https://github.com/prestige12138/universal-web-api.git
+   cd universal-web-api
+   ```
 2. **Start the Service**:
    * **Windows**: Double-click **`start.bat`**.
    * **macOS / Linux**: Run **`python3 start.py`** in your terminal.
@@ -71,7 +108,7 @@ graph TD
 
 ---
 
-## Continue ChatGPT Web Conversations
+## Added by This Fork: ChatGPT Web Thread Bridge
 
 The thread bridge lists recent conversations from the ChatGPT web sidebar and lets a terminal or OpenAI-compatible client continue a real `https://chatgpt.com/c/<thread-id>` conversation. Keep a logged-in ChatGPT tab open in the controlled browser.
 

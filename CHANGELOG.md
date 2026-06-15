@@ -1,5 +1,23 @@
 # 更新日志
 
+## 2026-06-15 - 本 Fork 新增
+
+> 本节只记录 `prestige12138/universal-web-api` 相对上游 `lumingya/universal-web-api` 的增量。以下功能由本 Fork 实现，**上游原项目不包含**。
+
+feat:
+- 新增 ChatGPT 真实网页线程桥接：从侧边栏枚举会话、复用或创建指定 `/c/<thread-id>` 标签页，并保留网页端真实历史。
+- 新增线程专用 OpenAI 兼容接口：`GET /api/chatgpt/threads`、现有线程续聊和新线程创建端点。
+- 新增 CatGPT-Gateway 风格简化接口：`GET /threads`、`POST /thread/new`、`POST /thread/{thread-id}/chat`。
+- 新增交互式终端客户端 `chatgpt_cli.py`，支持选择、新建和切换网页会话。
+- 新增 Obsidian 接入方式，每个真实 ChatGPT thread 可作为独立 OpenAI Base URL。
+
+security/fix:
+- 新增 ChatGPT 登录态预检、错误线程重定向校验、严格 UUID/域名校验和本地 Base URL 限制。
+- 已有网页线程只转发最后一条 `user` 消息，避免客户端历史与网页历史重复。
+- 修复 macOS 已运行普通 Chrome 时受控实例可能退出的问题，并将远程调试地址限制为 `127.0.0.1`。
+- 默认关闭上游自动更新，防止 Fork 增量被上游发布包覆盖。
+- 升级 FastAPI/Starlette 依赖并补充线程 API、CLI、标签页创建及启动逻辑测试。
+
 ## 2026-06-09
 
 fix:
