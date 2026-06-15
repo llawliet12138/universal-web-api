@@ -71,6 +71,39 @@ graph TD
 
 ---
 
+## Continue ChatGPT Web Conversations
+
+The thread bridge lists recent conversations from the ChatGPT web sidebar and lets a terminal or OpenAI-compatible client continue a real `https://chatgpt.com/c/<thread-id>` conversation. Keep a logged-in ChatGPT tab open in the controlled browser.
+
+Start the interactive terminal client:
+
+```bash
+python3 chatgpt_cli.py
+```
+
+For Obsidian plugins that accept a custom OpenAI endpoint, use:
+
+```text
+Base URL: http://127.0.0.1:8199/api/chatgpt/threads/<thread-id>/v1
+API Key:  Any value, or AUTH_TOKEN when authentication is enabled
+Model:    web-browser
+```
+
+Useful endpoints:
+
+```text
+GET  /api/chatgpt/threads
+POST /api/chatgpt/threads/{thread-id}/v1/chat/completions
+POST /api/chatgpt/threads/new/v1/chat/completions
+GET  /threads
+POST /thread/{thread-id}/chat
+POST /thread/new
+```
+
+Creating a conversation only supports `stream=false`, because the web thread ID is not available until the first response completes. Existing conversations support streaming and send only the latest `user` message from an OpenAI request; the web conversation remains the source of truth for history. A `401 chatgpt_login_required` response means the controlled browser must be logged in. Keep the service bound to localhost and enable `AUTH_ENABLED` if other local applications can reach the port.
+
+---
+
 ## 🎯 Supported Sites
 
 Built-in automation rules are available for several mainstream AI websites. For unlisted sites, you can use the built-in AI assistant to analyze page DOM structures and generate adaptations. See [Add a New Site Guide](./static/tutorial/index.html#add-site-guide).

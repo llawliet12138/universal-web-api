@@ -781,6 +781,71 @@ class TabPoolManager:
                 "tab": info,
             }
 
+    def create_shared_url_tab(
+        self,
+        url: str,
+        *,
+        expected_domain: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Open a validated HTTPS URL in a shared-cookie controlled tab."""
+        target_url = str(url or "").strip()
+        target_domain = extract_remote_site_domain(target_url) or ""
+        required_domain = normalize_route_domain(expected_domain or "")
+        if not target_url or not target_url.lower().startswith("https://") or not target_domain:
+            return {"ok": False, "error": "invalid_url"}
+        if required_domain and normalize_route_domain(target_domain) != required_domain:
+            return {"ok": False, "error": "url_domain_mismatch"}
+
+        with self._condition:
+            self._scan_new_tabs()
+            if len(self._tabs) >= self.max_tabs:
+                return {"ok": False, "error": "tab_pool_full"}
+
+        created = self._create_shared_tab(target_url, background=False, new_window=True)
+        if not created:
+            return {"ok": False, "error": "create_shared_tab_failed"}
+
+        with self._condition:
+            if len(self._tabs) >= self.max_tabs:
+                self._close_raw_tab(created.get("raw_tab_id"))
+                return {"ok": False, "error": "tab_pool_full"}
+
+            session = self._wrap_tab(
+                created["tab"],
+                created["raw_tab_id"],
+                browser_context_id=created.get("browser_context_id"),
+                is_isolated_context=False,
+            )
+            self._tabs[session.id] = session
+            self._start_global_monitor_for_session(session)
+            self._last_scan_time = time.time()
+            self._condition.notify_all()
+
+            info = session.get_info(use_cached_url=True)
+            route_domain = str(info.get("route_domain") or "").strip()
+            url_route_token = str(info.get("url_route_token") or "").strip()
+            enriched_info = {
+                **info,
+                "tab_route_prefix": f"/tab/{session.persistent_index}",
+                "domain_route_prefix": f"/url/{route_domain}" if route_domain else "",
+                "preset_route_domain": str(info.get("current_domain") or route_domain).strip(),
+                "exact_url_route_prefix": f"/tab-url/{url_route_token}" if url_route_token else "",
+            }
+            preset_domain = enriched_info["preset_route_domain"]
+            enriched_info["preset_domain_route_prefix"] = (
+                f"/url/{preset_domain}" if preset_domain else ""
+            )
+            enriched_info["route_prefix"] = (
+                enriched_info["domain_route_prefix"] or enriched_info["tab_route_prefix"]
+            )
+
+            return {
+                "ok": True,
+                "domain": target_domain,
+                "message": f"已打开共享 Cookie URL: {target_url}",
+                "tab": enriched_info,
+            }
+
     def _order_sessions_for_allocation(
         self,
         sessions: List[TabSession],

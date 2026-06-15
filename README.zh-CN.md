@@ -71,6 +71,70 @@ graph TD
 
 ---
 
+## 💬 继续 ChatGPT 网页会话
+
+线程桥接功能可以列出 ChatGPT 网页侧边栏中的近期会话，并让终端或 OpenAI 兼容客户端继续指定的真实网页会话。消息和回答会保留在 `https://chatgpt.com/c/<thread-id>` 中。
+
+使用前请在受控浏览器中登录 `chatgpt.com`，并至少打开一个 ChatGPT 页面。网页可以留在后台。服务应只监听 `127.0.0.1`；如需认证，在 `.env` 中设置 `AUTH_ENABLED=true` 和随机的 `AUTH_TOKEN`。
+
+### 终端直接聊天
+
+```bash
+python3 chatgpt_cli.py
+```
+
+CLI 会列出网页近期会话，支持选择继续或新建。启用认证时：
+
+```bash
+python3 chatgpt_cli.py --token "$AUTH_TOKEN"
+```
+
+也可以直接指定网页 URL 中的会话 UUID：
+
+```bash
+python3 chatgpt_cli.py --thread 123e4567-e89b-12d3-a456-426614174000
+```
+
+### Obsidian / OpenAI 兼容客户端
+
+先查询近期会话：
+
+```bash
+curl http://127.0.0.1:8199/api/chatgpt/threads
+```
+
+把支持自定义 OpenAI Base URL 的 Obsidian 插件配置为：
+
+```text
+Base URL: http://127.0.0.1:8199/api/chatgpt/threads/<thread-id>/v1
+API Key:  任意值；启用 AUTH_ENABLED 时填写 AUTH_TOKEN
+Model:    web-browser
+```
+
+标准流式请求示例：
+
+```bash
+curl http://127.0.0.1:8199/api/chatgpt/threads/<thread-id>/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"web-browser","stream":true,"messages":[{"role":"user","content":"继续总结这个会话"}]}'
+```
+
+已有线程接口只会把请求中最后一条 `user` 消息发送到网页，避免 Obsidian/OpenAI 客户端携带的完整历史在真实网页会话中重复出现；历史记录以 ChatGPT 网页线程为准。若返回 `401 chatgpt_login_required`，请先在受控浏览器中完成登录。
+
+新建网页会话需要等待首轮完成后才能取得 thread ID，因此该接口仅接受 `stream=false`：
+
+```bash
+curl http://127.0.0.1:8199/api/chatgpt/threads/new/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"web-browser","stream":false,"messages":[{"role":"user","content":"创建一个新会话"}]}'
+```
+
+兼容 CatGPT-Gateway 风格的简化端点包括 `GET /threads`、`POST /thread/new` 和 `POST /thread/{thread-id}/chat`。
+
+> 限制：侧边栏采用虚拟滚动时，`GET /threads` 通常只能返回网页当前已加载的近期会话；同一会话的请求会由标签页池串行执行。此功能仍属于本地网页自动化，可能受 ChatGPT 页面改版和账号策略影响。
+
+---
+
 ## 🎯 已适配站点列表
 
 系统已内置多款主流 AI 站点的自动化交互规则。对于未收录的网站，控制台还支持通过 AI 自动分析网页 DOM 结构进行适配，详情请参阅 [新增站点指南](./static/tutorial/index.html#add-site-guide)。

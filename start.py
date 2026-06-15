@@ -36,7 +36,7 @@ ENV_DEFAULTS = {
     "APP_HOST": "127.0.0.1",
     "APP_PORT": "8199",
     "BROWSER_PORT": "9222",
-    "AUTO_UPDATE_ENABLED": "true",
+    "AUTO_UPDATE_ENABLED": "false",
     "GITHUB_REPO": DEFAULT_GITHUB_REPO,
     "PYTHON_INSTALL_VERSION": DEFAULT_PYTHON_INSTALL_VERSION,
     "PROXY_ENABLED": "false",
@@ -564,6 +564,23 @@ def _resolve_browser_path() -> str:
     return ""
 
 
+def _find_macos_app_bundle(browser_path: Path) -> Path | None:
+    for candidate in (browser_path, *browser_path.parents):
+        if candidate.suffix.lower() == ".app":
+            return candidate
+    return None
+
+
+def _browser_launch_command(browser_path: str, browser_args: list[str]) -> list[str]:
+    if sys.platform != "darwin":
+        return list(browser_args)
+
+    app_bundle = _find_macos_app_bundle(Path(browser_path))
+    if app_bundle is None:
+        return list(browser_args)
+    return ["open", "-na", str(app_bundle), "--args", *browser_args[1:]]
+
+
 def _launch_browser_if_needed() -> None:
     _section("准备 Chromium 内核浏览器")
     browser_port = int(os.getenv("BROWSER_PORT", "9222") or "9222")
@@ -585,6 +602,7 @@ def _launch_browser_if_needed() -> None:
     browser_args = [
         browser_path,
         f"--remote-debugging-port={browser_port}",
+        "--remote-debugging-address=127.0.0.1",
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
@@ -609,8 +627,9 @@ def _launch_browser_if_needed() -> None:
             _log(f"[INFO] 代理已启用: {proxy_address}")
 
     _log(f"[INFO] 启动浏览器: {browser_path}")
+    launch_command = _browser_launch_command(browser_path, browser_args)
     subprocess.Popen(
-        browser_args,
+        launch_command,
         cwd=str(PROJECT_DIR),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
