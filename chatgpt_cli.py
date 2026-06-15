@@ -12,6 +12,31 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
+def _http_error_message(exc: HTTPError) -> str:
+    raw_detail = exc.read().decode("utf-8", errors="replace").strip()
+    detail = raw_detail
+    if raw_detail:
+        try:
+            payload = json.loads(raw_detail)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            detail_value = payload.get("detail")
+            if isinstance(detail_value, str):
+                detail = detail_value.strip()
+
+    if detail == "chatgpt_login_required":
+        return "受控浏览器尚未登录；请在受控浏览器中登录 ChatGPT 后重试"
+    if exc.code == 503:
+        return (
+            "本地服务暂不可用；请确认另一个终端中的 python3 start.py 仍在运行，"
+            "并确认受控浏览器已启动并登录 ChatGPT"
+        )
+    if detail:
+        return f"HTTP {exc.code}: {detail}"
+    return f"HTTP {exc.code}: {exc.reason or '请求失败'}"
+
+
 class ChatGPTWebClient:
     def __init__(
         self,
@@ -77,10 +102,12 @@ class ChatGPTWebClient:
             with self.opener(request, timeout=self.timeout) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+            raise RuntimeError(_http_error_message(exc)) from exc
         except URLError as exc:
-            raise RuntimeError(f"无法连接本地服务: {exc.reason}") from exc
+            raise RuntimeError(
+                "无法连接本地服务；请先在另一个终端运行 python3 start.py，"
+                f"并保持该终端运行（原因: {exc.reason}）"
+            ) from exc
         except json.JSONDecodeError as exc:
             raise RuntimeError("本地服务返回了无效 JSON") from exc
 

@@ -112,11 +112,29 @@ graph TD
 
 The thread bridge lists recent conversations from the ChatGPT web sidebar and lets a terminal or OpenAI-compatible client continue a real `https://chatgpt.com/c/<thread-id>` conversation. Keep a logged-in ChatGPT tab open in the controlled browser.
 
-Start the interactive terminal client:
+The CLI is only a client; it does not start the API service. Use two terminals and keep Terminal 1 running.
+
+**Terminal 1: start the service and controlled browser**
 
 ```bash
+cd universal-web-api
+python3 start.py
+```
+
+Log in to ChatGPT in the controlled browser and wait until the service reports that it is ready.
+
+**Terminal 2: start the chat client**
+
+```bash
+cd universal-web-api
 python3 chatgpt_cli.py
 ```
+
+Troubleshooting:
+
+- `Cannot connect to local service`: Terminal 1 is not running `python3 start.py`, or the service exited.
+- `HTTP 503`: The service is still starting, the controlled browser is disconnected, or it is closing.
+- `chatgpt_login_required`: Log in to ChatGPT in the controlled browser.
 
 For Obsidian plugins that accept a custom OpenAI endpoint, use:
 

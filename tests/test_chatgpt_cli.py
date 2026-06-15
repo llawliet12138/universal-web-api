@@ -76,7 +76,7 @@ def test_client_rejects_non_local_base_url():
 @pytest.mark.parametrize(
     ("error", "message"),
     [
-        (URLError("offline"), "无法连接本地服务"),
+        (URLError("offline"), "请先在另一个终端运行 python3 start.py"),
         (
             HTTPError(
                 "http://127.0.0.1:8199/threads",
@@ -95,6 +95,36 @@ def test_client_translates_transport_errors(error, message):
 
     client = ChatGPTWebClient("http://127.0.0.1:8199", opener=opener)
     with pytest.raises(RuntimeError, match=message):
+        client.list_threads()
+
+
+def test_client_explains_empty_service_unavailable_response():
+    def opener(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            503,
+            "Service Unavailable",
+            {},
+            BytesIO(b""),
+        )
+
+    client = ChatGPTWebClient("http://127.0.0.1:8199", opener=opener)
+    with pytest.raises(RuntimeError, match="受控浏览器已启动并登录 ChatGPT"):
+        client.list_threads()
+
+
+def test_client_explains_chatgpt_login_required_response():
+    def opener(request, timeout):
+        raise HTTPError(
+            request.full_url,
+            401,
+            "Unauthorized",
+            {},
+            BytesIO(b'{"detail":"chatgpt_login_required"}'),
+        )
+
+    client = ChatGPTWebClient("http://127.0.0.1:8199", opener=opener)
+    with pytest.raises(RuntimeError, match="受控浏览器中登录 ChatGPT"):
         client.list_threads()
 
 

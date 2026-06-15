@@ -116,7 +116,21 @@ graph TD
 
 ### 终端直接聊天
 
+CLI 是客户端，不会自行启动 API 服务。请使用两个终端，并保持终端 1 持续运行。
+
+**终端 1：启动服务和受控浏览器**
+
 ```bash
+cd universal-web-api
+python3 start.py
+```
+
+在自动打开的受控浏览器中登录 ChatGPT。看到服务输出“服务已就绪”后，不要关闭该终端。
+
+**终端 2：启动聊天客户端**
+
+```bash
+cd universal-web-api
 python3 chatgpt_cli.py
 ```
 
@@ -131,6 +145,12 @@ python3 chatgpt_cli.py --token "$AUTH_TOKEN"
 ```bash
 python3 chatgpt_cli.py --thread 123e4567-e89b-12d3-a456-426614174000
 ```
+
+错误排查：
+
+- `无法连接本地服务`：终端 1 没有运行 `python3 start.py`，或服务已经退出。
+- `HTTP 503`：服务正在启动、受控浏览器未连接，或浏览器正在退出；等待服务就绪后重试。
+- `chatgpt_login_required`：需要在受控浏览器中登录 ChatGPT。
 
 ### Obsidian / OpenAI 兼容客户端
 
