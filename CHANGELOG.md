@@ -2,6 +2,9 @@
 
 ## 2026-06-15 - 本 Fork 新增
 
+- ChatGPT 线程桥接改为每客户端一个后台标签页，切换会话复用，退出或空闲超时自动回收；不再接管或关闭用户手动打开的页面。
+- 新增 `X-ChatGPT-Bridge-ID`、桥接 activate/release API，并修复 target 失效时网络监听访问空 driver 导致的 DOM 慢回退。
+
 > 本节只记录 `prestige12138/universal-web-api` 相对上游 `lumingya/universal-web-api` 的增量。以下功能由本 Fork 实现，**上游原项目不包含**。
 
 feat:

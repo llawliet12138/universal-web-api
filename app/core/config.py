@@ -29,6 +29,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache
 from collections import deque
 
+from terminal_display import (
+    get_terminal_display,
+    log_record_is_permanent,
+    resolve_terminal_log_mode,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 _shared_file_log_handler: Optional[logging.Handler] = None
@@ -1289,6 +1295,42 @@ class _ConsoleColorFormatter(logging.Formatter):
         return f"{color}{formatted}{self.RESET}"
 
 
+class _CompactConsoleHandler(logging.Handler):
+    """Console handler that keeps non-key service logs in a temporary status line."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self._display = get_terminal_display()
+
+    def _activity_title(self, record: logging.LogRecord) -> str:
+        request_tag = _record_request_tag(record)
+        logger_name = _record_logger_name(record) or str(record.name or "APP").upper()
+        if request_tag and request_tag != "SYSTEM":
+            return f"[REQ {request_tag}] {logger_name} running"
+        return f"[{logger_name}] running"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = _record_display_message(record)
+            console_limit = _get_log_display_limit("LOG_CONSOLE_MAX_CHARS", 1200)
+            message, _ = _truncate_long_message(message, console_limit)
+            formatted = self.format(record)
+            permanent = log_record_is_permanent(
+                str(record.levelname or "INFO"),
+                _record_logger_name(record),
+                message,
+            )
+            if record.exc_info:
+                permanent = True
+            if permanent:
+                self._display.permanent(formatted)
+            else:
+                self._display.ensure_section(self._activity_title(record))
+                self._display.status(formatted)
+        except Exception:
+            self.handleError(record)
+
+
 class _FileLogFormatter(logging.Formatter):
     """文件日志使用结构化字段，避免控制台前缀被再次包裹。"""
 
@@ -1451,6 +1493,32 @@ def get_shared_file_log_handler() -> Optional[logging.Handler]:
             _shared_file_log_handler = None
 
         return _shared_file_log_handler
+
+
+def create_console_log_handler() -> logging.Handler:
+    terminal_mode = resolve_terminal_log_mode()
+    if terminal_mode in {"status", "block"} and get_terminal_display().dynamic:
+        handler: logging.Handler = _CompactConsoleHandler()
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(_ConsoleColorFormatter())
+    setattr(handler, "_codex_secure_handler", "console")
+    return handler
+
+
+def configure_root_console_logging(root_logger: Optional[logging.Logger] = None) -> None:
+    logger = root_logger or logging.getLogger()
+    with _logger_setup_lock:
+        for handler in list(logger.handlers):
+            if getattr(handler, "_codex_secure_handler", None) == "console":
+                return
+
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+                logger.removeHandler(handler)
+
+        logger.addHandler(create_console_log_handler())
 
 
 _REQUEST_FINISH_PATTERN = re.compile(r"^完成 \(([\d.]+)s\)$")
@@ -2369,11 +2437,7 @@ class SecureLogger:
             }
 
             if "console" not in existing_kinds:
-                console_handler = logging.StreamHandler(sys.stdout)
-                console_handler.setLevel(logging.DEBUG)
-                console_handler.setFormatter(_ConsoleColorFormatter())
-                setattr(console_handler, "_codex_secure_handler", "console")
-                logger.addHandler(console_handler)
+                logger.addHandler(create_console_log_handler())
 
             file_handler = get_shared_file_log_handler()
             if file_handler is not None and file_handler not in logger.handlers:
@@ -2918,6 +2982,8 @@ __all__ = [
     'SecureLogger',
     'logger',
     'get_logger',
+    'create_console_log_handler',
+    'configure_root_console_logging',
     'log_collector',  # 🆕 供 routes.py 使用
     
     # 异常

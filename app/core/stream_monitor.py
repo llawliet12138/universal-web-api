@@ -490,6 +490,9 @@ class StreamMonitor:
         completion_id: Optional[str] = None,
         baseline_snapshot: Optional[Dict[str, Any]] = None,
         sent_content_length: int = 0,
+        silence_threshold_override: Optional[float] = None,
+        silence_threshold_fallback_override: Optional[float] = None,
+        stable_count_threshold_override: Optional[int] = None,
     ) -> Generator[str, None, None]:
         self._last_visual_reply_log_info = None
         logger.debug("流式监听启动")
@@ -663,7 +666,14 @@ class StreamMonitor:
                         f"baseline_len={ctx.active_turn_baseline_len}, "
                         f"sent={seed_len}, current_len={len(current_text)}"
                     )
-            yield from self._stream_output_phase(selector, ctx, completion_id=completion_id)
+            yield from self._stream_output_phase(
+                selector,
+                ctx,
+                completion_id=completion_id,
+                silence_threshold_override=silence_threshold_override,
+                silence_threshold_fallback_override=silence_threshold_fallback_override,
+                stable_count_threshold_override=stable_count_threshold_override,
+            )
         else:
             logger.warning("[Exit] 未检测到 AI 回复，退出监控")
 
@@ -858,8 +868,15 @@ class StreamMonitor:
         
         return False, ""
 
-    def _stream_output_phase(self, selector: str, ctx: StreamContext,
-                             completion_id: Optional[str] = None) -> Generator[str, None, None]:
+    def _stream_output_phase(
+        self,
+        selector: str,
+        ctx: StreamContext,
+        completion_id: Optional[str] = None,
+        silence_threshold_override: Optional[float] = None,
+        silence_threshold_fallback_override: Optional[float] = None,
+        stable_count_threshold_override: Optional[int] = None,
+    ) -> Generator[str, None, None]:
         """流式输出阶段（v5.5：增加图片变化检测）"""
         silence_start = time.time()
         has_output = False
@@ -1056,6 +1073,15 @@ class StreamMonitor:
             silence_threshold = BrowserConstants.STREAM_SILENCE_THRESHOLD
             silence_threshold_fallback = BrowserConstants.STREAM_SILENCE_THRESHOLD_FALLBACK
             stable_count_threshold = BrowserConstants.STREAM_STABLE_COUNT_THRESHOLD
+            if silence_threshold_override is not None:
+                silence_threshold = max(0.5, float(silence_threshold_override))
+            if silence_threshold_fallback_override is not None:
+                silence_threshold_fallback = max(
+                    float(silence_threshold),
+                    float(silence_threshold_fallback_override),
+                )
+            if stable_count_threshold_override is not None:
+                stable_count_threshold = max(1, int(stable_count_threshold_override))
             if ctx.network_sent_offset_confirmed:
                 silence_threshold = min(float(silence_threshold), 1.2)
                 silence_threshold_fallback = min(float(silence_threshold_fallback), 2.0)

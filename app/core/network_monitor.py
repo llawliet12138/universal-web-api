@@ -400,6 +400,7 @@ class NetworkMonitor:
         return (
             "监听未启动或已停止" in err_text
             or ("NoneType" in err_text and "is_running" in err_text)
+            or ("NoneType" in err_text and "set_callback" in err_text)
         )
 
     def _sleep_after_listen_restart(self, attempts: int) -> None:
@@ -512,6 +513,10 @@ class NetworkMonitor:
     def _start_listen(self):
         if not self._listen_pattern:
             raise NetworkMonitorError("listen_pattern 未配置")
+
+        driver = getattr(self.tab, "driver", None)
+        if driver is None or not getattr(driver, "is_running", False):
+            raise NetworkMonitorError("标签页 target 已失效，无法启动网络监听")
 
         self._reset_prefetched_responses()
         self._reset_stream_chunk_merge_cache()

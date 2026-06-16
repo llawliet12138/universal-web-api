@@ -2114,7 +2114,18 @@ def _run_update_check(repo: Optional[str] = None) -> Dict[str, Any]:
 
     _set_update_check_state(checking=True, repo=target_repo, error="")
     try:
-        release = fetch_latest_release(target_repo)
+        if str(os.getenv("TERMINAL_LOG_MODE", "block") or "block").strip().lower() == "plain":
+            release = fetch_latest_release(target_repo)
+        else:
+            import contextlib
+            import io
+
+            captured_output = io.StringIO()
+            with contextlib.redirect_stdout(captured_output), contextlib.redirect_stderr(captured_output):
+                release = fetch_latest_release(target_repo)
+            captured_text = captured_output.getvalue().strip()
+            if captured_text:
+                logger.debug(f"[startup] 版本检查内部输出已折叠: {captured_text.splitlines()[-1]}")
         if not release:
             raise RuntimeError("无法获取最新版本信息")
         payload = _build_update_check_payload(release, target_repo)

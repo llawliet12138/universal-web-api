@@ -37,6 +37,7 @@
 | **终端客户端** | 无需回到网页即可选择、新建、切换和继续网页会话 | `chatgpt_cli.py` |
 | **Obsidian 接入方式** | 以每个真实网页线程为独立 OpenAI Base URL | `/api/chatgpt/threads/<id>/v1` |
 | **线程安全边界** | 未登录快速返回 401、错误线程返回 404、续聊只发送最后一条 `user` 消息 | `app/api/chatgpt_thread_routes.py` |
+| **受控浏览器启动直达站点** | `python3 start.py --site chatgpt` 可跳过受控浏览器引导页并直接打开支持的 AI 站点 | `start.py`、`main.py` |
 | **macOS 启动修复** | 普通 Chrome 已运行时仍创建独立受控实例；调试端口仅监听本机 | `start.py` |
 | **Fork 更新保护** | 默认关闭上游自动更新，避免新增功能被上游发布包覆盖 | `.env.example`、`start.py` |
 | **新增验证体系** | 线程服务、API、CLI、浏览器启动与安全边界测试 | `tests/test_*` |
@@ -100,8 +101,10 @@ graph TD
 2. **一键启动**：
    * **Windows**：双击运行根目录下的 **`start.bat`**。
    * **macOS / Linux**：在终端执行 **`python3 start.py`**。
-3. **完成初始化**：等待依赖包自动校验安装完成后，系统会自动弹出一个受控的浏览器窗口，并在普通浏览器中打开本地控制台 `http://127.0.0.1:8199`。受控浏览器只建议放 AI 站点，控制台和教程请在普通浏览器里查看。
-4. **账号登录**：在受控浏览器窗口中，登录您拥有的 AI 网站账号（如 ChatGPT、DeepSeek 等），并保持目标站点停留在可对话页面。
+   * **本 Fork 新增**：可使用 `--site` 让受控浏览器直接打开目标 AI 网站，例如 **`python3 start.py --site chatgpt`**、**`python3 start.py --site grok`** 或 **`python3 start.py --first --site chatgpt`**。`--first` 只控制是否在系统默认浏览器打开教程页。
+   * 默认会尽量静默启动受控 Chrome，不抢前台；需要登录时使用 **`python3 start.py --login --site chatgpt`**。
+3. **完成初始化**：等待依赖包自动校验安装完成后，服务会启动受控浏览器，并在普通浏览器中打开本地控制台 `http://127.0.0.1:8199`。受控浏览器只建议放 AI 站点，控制台和教程请在普通浏览器里查看。
+4. **账号登录**：如需登录，在启动时加 `--login`，在前台打开的受控浏览器窗口中登录您拥有的 AI 网站账号（如 ChatGPT、DeepSeek 等），并保持目标站点停留在可对话页面。
 5. **客户端配置**：在您的任意 AI 客户端（如翻译插件、Chat UI）中修改 API 配置：
    * **API 地址 (Base URL)**：`http://127.0.0.1:8199/v1`
    * **API Key**：若未在 `.env` 中启用授权认证，可填任意值（如 `sk-local`）；若启用了配置中的密钥验证，请填写对应的自定义 Token。
@@ -146,6 +149,8 @@ python3 chatgpt_cli.py --token "$AUTH_TOKEN"
 python3 chatgpt_cli.py --thread 123e4567-e89b-12d3-a456-426614174000
 ```
 
+本 Fork 新增的 CLI 会为自身创建一个不可见的后台桥接标签页：不会为每次切换弹出新窗口，切换会话时复用同一标签页，`/exit`、Ctrl+C 或 EOF 退出时自动关闭。CLI 异常退出后，服务会在空闲 30 分钟后回收该标签页。用户手动打开的 ChatGPT 页面只用于登录和读取会话列表，不会被桥接程序导航或关闭。
+
 错误排查：
 
 - `无法连接本地服务`：终端 1 没有运行 `python3 start.py`，或服务已经退出。
@@ -176,6 +181,14 @@ curl http://127.0.0.1:8199/api/chatgpt/threads/<thread-id>/v1/chat/completions \
   -d '{"model":"web-browser","stream":true,"messages":[{"role":"user","content":"继续总结这个会话"}]}'
 ```
 
+支持自定义 Header 的客户端可为每个客户端生成一个 UUID，并在聊天请求中持续发送：
+
+```text
+X-ChatGPT-Bridge-ID: <client-uuid>
+```
+
+也可以提前调用 `POST /api/chatgpt/bridge/<client-uuid>/activate`，请求体为 `{"thread_id":"<thread-id>"}`；退出时调用 `DELETE /api/chatgpt/bridge/<client-uuid>`。不支持自定义 Header 的 Obsidian 插件仍可直接使用上述 OpenAI 地址，服务会为每次请求创建并在响应结束后关闭临时后台标签，不会持续累积窗口。
+
 已有线程接口只会把请求中最后一条 `user` 消息发送到网页，避免 Obsidian/OpenAI 客户端携带的完整历史在真实网页会话中重复出现；历史记录以 ChatGPT 网页线程为准。若返回 `401 chatgpt_login_required`，请先在受控浏览器中完成登录。
 
 新建网页会话需要等待首轮完成后才能取得 thread ID，因此该接口仅接受 `stream=false`：
@@ -187,6 +200,8 @@ curl http://127.0.0.1:8199/api/chatgpt/threads/new/v1/chat/completions \
 ```
 
 兼容 CatGPT-Gateway 风格的简化端点包括 `GET /threads`、`POST /thread/new` 和 `POST /thread/{thread-id}/chat`。
+
+桥接标签默认空闲回收时间为 1800 秒，可通过 `CHATGPT_BRIDGE_TTL_SEC` 调整。受控 Chrome 进程不会随单个客户端退出而关闭，以保留登录 Cookie 并服务其他客户端。
 
 > 限制：侧边栏采用虚拟滚动时，`GET /threads` 通常只能返回网页当前已加载的近期会话；同一会话的请求会由标签页池串行执行。此功能仍属于本地网页自动化，可能受 ChatGPT 页面改版和账号策略影响。
 

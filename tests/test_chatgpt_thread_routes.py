@@ -2,7 +2,7 @@ import json
 
 import pytest
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.chat import ChatRequest
 from app.api import chatgpt_thread_routes as routes
@@ -19,9 +19,14 @@ def test_router_registers_public_thread_endpoints():
     assert "/api/chatgpt/threads" in paths
     assert "/api/chatgpt/threads/new/v1/chat/completions" in paths
     assert "/api/chatgpt/threads/{thread_id}/v1/chat/completions" in paths
+    assert "/api/chatgpt/bridge/{bridge_id}/activate" in paths
+    assert "/api/chatgpt/bridge/{bridge_id}" in paths
 
 
 class FakeRequest:
+    def __init__(self, bridge_id=""):
+        self.headers = {"x-chatgpt-bridge-id": bridge_id} if bridge_id else {}
+
     async def is_disconnected(self):
         return False
 
@@ -30,6 +35,10 @@ class FakeThreadService:
     def __init__(self):
         self.ensured = []
         self.created = 0
+        self.activated = []
+        self.started = []
+        self.ended = []
+        self.released = []
 
     def list_threads(self):
         return [{"id": THREAD_ID, "title": "Test", "is_open": True, "tab_index": 4}]
@@ -48,6 +57,120 @@ class FakeThreadService:
             "url": f"https://chatgpt.com/c/{THREAD_ID}",
             "tab_index": tab_index,
         }
+
+    def activate_bridge(self, bridge_id, thread_id=None):
+        self.activated.append((bridge_id, thread_id))
+        return {
+            "persistent_index": 4,
+            "url": f"https://chatgpt.com/c/{thread_id}" if thread_id else "https://chatgpt.com/",
+        }
+
+    def begin_bridge_request(self, bridge_id, thread_id=None):
+        self.started.append((bridge_id, thread_id))
+        tab_info = self.activate_bridge(bridge_id, thread_id)
+        if thread_id is None:
+            return {**tab_info, "persistent_index": 5}
+        return tab_info
+
+    def end_bridge_request(self, bridge_id):
+        self.ended.append(bridge_id)
+
+    def release_bridge(self, bridge_id):
+        self.released.append(bridge_id)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_bridge_activate_and_release_routes(monkeypatch):
+    service = FakeThreadService()
+    monkeypatch.setattr(routes, "_get_thread_service", lambda: service)
+    bridge_id = "923e4567-e89b-12d3-a456-426614174008"
+
+    activated = await routes.activate_chatgpt_bridge(
+        bridge_id,
+        routes.BridgeActivateRequest(thread_id=THREAD_ID),
+        authenticated=True,
+    )
+    released = await routes.release_chatgpt_bridge(bridge_id, authenticated=True)
+
+    assert activated["tab_index"] == 4
+    assert service.activated == [(bridge_id, THREAD_ID)]
+    assert released == {"ok": True, "released": True}
+
+
+@pytest.mark.asyncio
+async def test_thread_route_uses_bridge_header_and_ends_request(monkeypatch):
+    service = FakeThreadService()
+
+    async def fake_chat_with_tab(tab_index, request, body, preset_name, authenticated):
+        return JSONResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(routes, "_get_thread_service", lambda: service)
+    monkeypatch.setattr(routes, "chat_with_tab", fake_chat_with_tab)
+    bridge_id = "a23e4567-e89b-12d3-a456-426614174009"
+
+    await routes.chat_in_chatgpt_thread(
+        THREAD_ID,
+        FakeRequest(bridge_id),
+        ChatRequest(messages=[{"role": "user", "content": "hello"}]),
+        authenticated=True,
+    )
+
+    assert service.started == [(bridge_id, THREAD_ID)]
+    assert service.ended == [bridge_id]
+    assert service.released == []
+
+
+@pytest.mark.asyncio
+async def test_streaming_thread_route_releases_only_after_iterator_finishes(monkeypatch):
+    service = FakeThreadService()
+
+    async def stream():
+        yield b"data: first\n\n"
+        assert service.ended == []
+        yield b"data: [DONE]\n\n"
+
+    async def fake_chat_with_tab(tab_index, request, body, preset_name, authenticated):
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    monkeypatch.setattr(routes, "_get_thread_service", lambda: service)
+    monkeypatch.setattr(routes, "chat_with_tab", fake_chat_with_tab)
+    bridge_id = "b23e4567-e89b-12d3-a456-426614174010"
+
+    response = await routes.chat_in_chatgpt_thread(
+        THREAD_ID,
+        FakeRequest(bridge_id),
+        ChatRequest(messages=[{"role": "user", "content": "hello"}], stream=True),
+        authenticated=True,
+    )
+
+    assert service.ended == []
+    chunks = [chunk async for chunk in response.body_iterator]
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert service.ended == [bridge_id]
+
+
+@pytest.mark.asyncio
+async def test_headerless_request_uses_and_releases_ephemeral_bridge(monkeypatch):
+    service = FakeThreadService()
+
+    async def fake_chat_with_tab(tab_index, request, body, preset_name, authenticated):
+        return JSONResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(routes, "_get_thread_service", lambda: service)
+    monkeypatch.setattr(routes, "chat_with_tab", fake_chat_with_tab)
+
+    await routes.chat_in_chatgpt_thread(
+        THREAD_ID,
+        FakeRequest(),
+        ChatRequest(messages=[{"role": "user", "content": "hello"}]),
+        authenticated=True,
+    )
+
+    assert len(service.started) == 1
+    ephemeral_id = service.started[0][0]
+    assert service.ended == [ephemeral_id]
+    assert service.released == [ephemeral_id]
 
 
 @pytest.mark.asyncio

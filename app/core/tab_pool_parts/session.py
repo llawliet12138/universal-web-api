@@ -39,6 +39,7 @@ class TabSession:
     preset_name: Optional[str] = None  # 🆕 当前显式指定的预设名称（None = 跟随站点默认预设）
     browser_context_id: Optional[str] = None
     is_isolated_context: bool = False
+    bridge_owner_id: Optional[str] = None
     transient_disconnect_until: float = 0.0
     transient_disconnect_reason: Optional[str] = None
     last_conversation_activity_at: float = 0.0
@@ -514,6 +515,7 @@ class TabSession:
             preset_name = self.preset_name
             is_isolated_context = self.is_isolated_context
             browser_context_id = self.browser_context_id
+            bridge_owner_id = self.bridge_owner_id
             last_conversation_activity_at = self.last_conversation_activity_at
             last_conversation_domain = self.last_conversation_domain
             last_conversation_preset_name = self.last_conversation_preset_name
@@ -548,6 +550,7 @@ class TabSession:
             "preset_name": preset_name,  # 🆕
             "is_isolated_context": is_isolated_context,
             "browser_context_id": browser_context_id,
+            "bridge_owned": bool(bridge_owner_id),
             "last_conversation_at": last_conversation_activity_at or None,
             "last_conversation_domain": last_conversation_domain,
             "last_conversation_preset_name": last_conversation_preset_name,
@@ -621,4 +624,3 @@ class TabSession:
             restore_visibility_emulation(self.tab, owner=self, reason=reason)
         except Exception as e:
             logger.debug(f"[{self.id}] visibility emulation cleanup failed: {e}")
-

@@ -513,6 +513,12 @@ class WorkflowExecutor(
 
     def _build_dom_fallback_kwargs(self) -> Dict[str, Any]:
         kwargs: Dict[str, Any] = {}
+        if str(getattr(self.session, "bridge_owner_id", "") or "").strip():
+            kwargs.update(
+                silence_threshold_override=1.5,
+                silence_threshold_fallback_override=2.5,
+                stable_count_threshold_override=2,
+            )
         try:
             if self._stream_monitor is not None:
                 baseline = self._stream_monitor.consume_send_baseline()

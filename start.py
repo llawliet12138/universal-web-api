@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import shutil
@@ -22,6 +23,12 @@ import time
 import urllib.request
 import venv
 from pathlib import Path
+
+from terminal_display import (
+    compact_one_line,
+    get_terminal_display,
+    startup_subprocess_log_path,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -46,6 +53,9 @@ ENV_DEFAULTS = {
     "BROWSER_PROFILE_DIR": "",
     "BROWSER_PROFILE_NAME": "",
     "PROFILE_CLEAN_ENABLED": "false",
+    "TERMINAL_LOG_MODE": "block",
+    "CONTROLLED_BROWSER_LOGIN_MODE": "false",
+    "CONTROLLED_BROWSER_OWNED": "false",
 }
 
 REQUIRED_PROJECT_FILES = [
@@ -55,11 +65,90 @@ REQUIRED_PROJECT_FILES = [
 ]
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Universal Web-to-API 启动脚本",
+    )
+    parser.add_argument(
+        "--debug-logs",
+        action="store_true",
+        help="完整逐行打印启动器、子进程和服务端日志，便于调试",
+    )
+    parser.add_argument(
+        "--plain-logs",
+        action="store_true",
+        help="等同于 --debug-logs",
+    )
+    parser.add_argument(
+        "--terminal-log-mode",
+        choices=("block", "status", "plain"),
+        help="覆盖终端日志显示模式",
+    )
+    parser.add_argument(
+        "--first",
+        action="store_true",
+        help="首次使用时在系统默认浏览器打开教程页",
+    )
+    parser.add_argument(
+        "--site",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="启动后在受控浏览器打开指定站点，可重复传入，如 --site chatgpt --site grok",
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="登录模式：前台打开受控浏览器，便于登录目标 AI 网站",
+    )
+    parser.add_argument(
+        "legacy_args",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(argv)
+    if args.legacy_args:
+        hints = []
+        for item in args.legacy_args:
+            token = str(item or "").strip()
+            if not token:
+                continue
+            if token.lower() == "first":
+                hints.append("--first")
+            else:
+                hints.append(f"--site {token}")
+        hint_text = f"，请使用: python3 start.py {' '.join(hints)}" if hints else ""
+        parser.error(f"不再支持裸启动参数: {', '.join(args.legacy_args)}{hint_text}")
+    return args
+
+
+def _apply_cli_overrides(args: argparse.Namespace) -> None:
+    if args.debug_logs or args.plain_logs:
+        os.environ["TERMINAL_LOG_MODE"] = "plain"
+    elif args.terminal_log_mode:
+        os.environ["TERMINAL_LOG_MODE"] = args.terminal_log_mode
+    if args.first:
+        os.environ["OPEN_DEFAULT_BROWSER_GUIDE"] = "true"
+    startup_sites = [
+        str(site).strip()
+        for site in (args.site or [])
+        if str(site).strip()
+    ]
+    if startup_sites:
+        os.environ["CONTROLLED_BROWSER_STARTUP_SITES"] = ",".join(startup_sites)
+    if args.login:
+        os.environ["CONTROLLED_BROWSER_LOGIN_MODE"] = "true"
+
+
 def _log(message: str = "") -> None:
-    print(message, flush=True)
+    get_terminal_display().write(message)
 
 
 def _section(title: str) -> None:
+    display = get_terminal_display()
+    if display.compact_enabled:
+        display.start_section(title)
+        return
     _log(f"[STEP] {title}")
     _log("----------------------------------------")
 
@@ -127,7 +216,11 @@ def _run(
     check: bool = True,
     capture: bool = False,
     env: dict | None = None,
+    passthrough: bool = False,
 ) -> subprocess.CompletedProcess:
+    if not capture and not passthrough and get_terminal_display().should_suppress_child_output():
+        return _run_managed_child(cmd, check=check, env=env)
+
     kwargs = {
         "cwd": str(PROJECT_DIR),
         "check": check,
@@ -141,8 +234,65 @@ def _run(
     return subprocess.run(cmd, **kwargs)
 
 
-def _run_project_python(args: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    return _run([str(_venv_python()), *args], check=check, capture=capture)
+def _append_startup_subprocess_log(cmd: list[str], lines: list[str], returncode: int) -> Path:
+    log_path = startup_subprocess_log_path(PROJECT_DIR)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8", errors="replace") as f:
+            f.write("\n")
+            f.write("=" * 80)
+            f.write("\n")
+            f.write(f"$ {' '.join(str(part) for part in cmd)}\n")
+            for line in lines:
+                f.write(line)
+            if lines and not lines[-1].endswith("\n"):
+                f.write("\n")
+            f.write(f"[exit {returncode}]\n")
+    except Exception:
+        pass
+    return log_path
+
+
+def _run_managed_child(cmd: list[str], *, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+    display = get_terminal_display()
+    output_lines: list[str] = []
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_DIR),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    assert process.stdout is not None
+    for line in process.stdout:
+        output_lines.append(line)
+        status = compact_one_line(line)
+        if status:
+            display.status(status)
+
+    returncode = process.wait()
+    log_path = _append_startup_subprocess_log(cmd, output_lines, returncode)
+    completed = subprocess.CompletedProcess(cmd, returncode)
+    setattr(completed, "compact_log_file", str(log_path))
+    if returncode != 0:
+        display.permanent(f"[WARN] 子进程退出码 {returncode}，详细输出: {log_path}")
+    if check and returncode != 0:
+        raise subprocess.CalledProcessError(returncode, cmd)
+    return completed
+
+
+def _run_project_python(
+    args: list[str],
+    *,
+    check: bool = True,
+    capture: bool = False,
+    passthrough: bool = False,
+) -> subprocess.CompletedProcess:
+    return _run([str(_venv_python()), *args], check=check, capture=capture, passthrough=passthrough)
 
 
 def _python_install_version() -> str:
@@ -578,7 +728,8 @@ def _browser_launch_command(browser_path: str, browser_args: list[str]) -> list[
     app_bundle = _find_macos_app_bundle(Path(browser_path))
     if app_bundle is None:
         return list(browser_args)
-    return ["open", "-na", str(app_bundle), "--args", *browser_args[1:]]
+    open_flags = "-na" if _env_flag("CONTROLLED_BROWSER_LOGIN_MODE") else "-gna"
+    return ["open", open_flags, str(app_bundle), "--args", *browser_args[1:]]
 
 
 def _launch_browser_if_needed() -> None:
@@ -589,6 +740,7 @@ def _launch_browser_if_needed() -> None:
     _log(f"[INFO] 浏览器配置目录: {profile_dir}")
 
     if _debug_port_ready(browser_port):
+        os.environ["CONTROLLED_BROWSER_OWNED"] = "false"
         _log("[WARN] Debug 端口已被占用，将复用现有浏览器实例")
         _log("[WARN] 如果后台标签页变慢，请关闭浏览器后重新运行启动脚本")
         _log(f"[OK] Debug 端口就绪: {browser_port}")
@@ -638,6 +790,7 @@ def _launch_browser_if_needed() -> None:
     _log("[INFO] 等待浏览器远程调试端口就绪...")
     for _ in range(15):
         if _debug_port_ready(browser_port):
+            os.environ["CONTROLLED_BROWSER_OWNED"] = "true"
             _log(f"[OK] 浏览器启动成功 - 端口 {browser_port}")
             _log()
             return
@@ -660,6 +813,7 @@ def _display_version_info() -> None:
 
 
 def _display_start_summary() -> None:
+    get_terminal_display().clear_status()
     host = os.getenv("APP_HOST", "127.0.0.1")
     port = os.getenv("APP_PORT", "8199")
     _log("========================================")
@@ -687,7 +841,9 @@ def _display_start_summary() -> None:
 
 def _run_service_loop() -> int:
     while True:
-        completed = _run_project_python(["main.py"], check=False)
+        get_terminal_display().clear_status()
+        completed = _run_project_python(["main.py"], check=False, passthrough=True)
+        get_terminal_display().clear_status()
         if completed.returncode == 0:
             _log()
             _log("[INFO] 服务已停止")
@@ -705,9 +861,60 @@ def _run_service_loop() -> int:
         time.sleep(3.0)
 
 
-def main() -> int:
+def _quit_owned_browser_if_needed() -> None:
+    if not _env_flag("CONTROLLED_BROWSER_OWNED"):
+        return
+
+    browser_port = int(os.getenv("BROWSER_PORT", "9222") or "9222")
+    if not _debug_port_ready(browser_port):
+        return
+
+    python_path = _venv_python()
+    if not python_path.exists():
+        _log("[WARN] 虚拟环境不存在，跳过受控浏览器退出清理")
+        return
+
+    code = r"""
+import sys
+from DrissionPage import Chromium, ChromiumOptions
+
+port = sys.argv[1]
+opts = ChromiumOptions()
+opts.set_address(f"127.0.0.1:{port}")
+opts.existing_only()
+browser = Chromium(addr_or_opts=opts)
+try:
+    browser.quit(timeout=5, force=False, del_data=False)
+except Exception:
+    browser.quit(timeout=3, force=True, del_data=False)
+"""
+    _log("[INFO] 正在退出本次启动的受控浏览器...")
+    try:
+        completed = subprocess.run(
+            [str(python_path), "-c", code, str(browser_port)],
+            cwd=str(PROJECT_DIR),
+            text=True,
+            capture_output=True,
+            timeout=12,
+        )
+    except Exception as exc:
+        _log(f"[WARN] 受控浏览器退出清理失败: {exc}")
+        return
+
+    if completed.returncode == 0:
+        _log("[OK] 受控浏览器已退出")
+        return
+
+    detail = (completed.stderr or completed.stdout or "").strip()
+    if detail:
+        detail = f": {detail.splitlines()[-1]}"
+    _log(f"[WARN] 受控浏览器退出清理失败{detail}")
+
+
+def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("PYTHONUTF8", "1")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     _log()
     _log("========================================")
@@ -718,6 +925,7 @@ def main() -> int:
     _section("加载配置")
     _load_env_file(PROJECT_DIR / ".env")
     _apply_env_defaults()
+    _apply_cli_overrides(args)
     _display_current_config()
 
     _check_python_version()
@@ -731,7 +939,10 @@ def main() -> int:
     _launch_browser_if_needed()
     _display_version_info()
     _display_start_summary()
-    return _run_service_loop()
+    try:
+        return _run_service_loop()
+    finally:
+        _quit_owned_browser_if_needed()
 
 
 if __name__ == "__main__":

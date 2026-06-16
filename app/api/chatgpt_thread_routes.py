@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.api.chat import ChatRequest
@@ -17,6 +18,7 @@ from app.core import get_browser
 from app.services.chatgpt_threads import (
     CHATGPT_CONTINUE_PRESET,
     ChatGPTThreadService,
+    normalize_bridge_id,
     normalize_thread_id,
 )
 
@@ -27,6 +29,10 @@ router = APIRouter(tags=["ChatGPT Threads"])
 class ThreadChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=500_000)
     model: str = Field(default="web-browser", min_length=1, max_length=200)
+
+
+class BridgeActivateRequest(BaseModel):
+    thread_id: str | None = None
 
 
 def _get_thread_service() -> ChatGPTThreadService:
@@ -46,6 +52,8 @@ def _translate_service_error(exc: RuntimeError) -> HTTPException:
         "chatgpt_login_required": 401,
         "chatgpt_thread_not_found": 404,
         "tab_pool_full": 409,
+        "chatgpt_bridge_busy": 409,
+        "bridge_tab_busy": 409,
     }.get(error, 503)
     return HTTPException(status_code=status_code, detail=error)
 
@@ -91,6 +99,104 @@ def _assistant_message(payload: Dict[str, Any]) -> str:
         return ""
 
 
+def _request_bridge(request: Request) -> tuple[str, bool]:
+    headers = getattr(request, "headers", {}) or {}
+    raw_bridge_id = str(headers.get("x-chatgpt-bridge-id") or "").strip()
+    if not raw_bridge_id:
+        return str(uuid.uuid4()), True
+    try:
+        return normalize_bridge_id(raw_bridge_id), False
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="ChatGPT bridge ID 无效") from exc
+
+
+async def _finish_bridge_request(
+    service: ChatGPTThreadService,
+    bridge_id: str,
+    *,
+    ephemeral: bool,
+) -> None:
+    await asyncio.to_thread(service.end_bridge_request, bridge_id)
+    if ephemeral:
+        await asyncio.to_thread(service.release_bridge, bridge_id)
+
+
+async def _finish_bridge_request_quietly(
+    service: ChatGPTThreadService,
+    bridge_id: str,
+    *,
+    ephemeral: bool,
+) -> None:
+    try:
+        await _finish_bridge_request(service, bridge_id, ephemeral=ephemeral)
+    except Exception:
+        pass
+
+
+def _wrap_stream_bridge_cleanup(
+    response: StreamingResponse,
+    service: ChatGPTThreadService,
+    bridge_id: str,
+    *,
+    ephemeral: bool,
+) -> StreamingResponse:
+    original_iterator = response.body_iterator
+
+    async def body_iterator():
+        try:
+            async for chunk in original_iterator:
+                yield chunk
+        finally:
+            await _finish_bridge_request(
+                service,
+                bridge_id,
+                ephemeral=ephemeral,
+            )
+
+    response.body_iterator = body_iterator()
+    return response
+
+
+async def _run_bridge_completion(
+    *,
+    service: ChatGPTThreadService,
+    thread_id: str | None,
+    request: Request,
+    body: ChatRequest,
+    latest_user_only: bool = False,
+):
+    bridge_id, ephemeral = _request_bridge(request)
+    try:
+        tab_info = await asyncio.to_thread(
+            service.begin_bridge_request,
+            bridge_id,
+            thread_id,
+        )
+        response = await _run_thread_completion(
+            tab_info=tab_info,
+            request=request,
+            body=body,
+            latest_user_only=latest_user_only,
+        )
+    except Exception:
+        await _finish_bridge_request_quietly(
+            service,
+            bridge_id,
+            ephemeral=ephemeral,
+        )
+        raise
+
+    if isinstance(response, StreamingResponse):
+        return _wrap_stream_bridge_cleanup(
+            response,
+            service,
+            bridge_id,
+            ephemeral=ephemeral,
+        )
+    await _finish_bridge_request(service, bridge_id, ephemeral=ephemeral)
+    return response
+
+
 async def _run_thread_completion(
     *,
     tab_info: Dict[str, Any],
@@ -122,6 +228,49 @@ async def list_chatgpt_threads(authenticated: bool = Depends(verify_auth)):
     return {"threads": threads, "count": len(threads)}
 
 
+@router.post("/api/chatgpt/bridge/{bridge_id}/activate")
+async def activate_chatgpt_bridge(
+    bridge_id: str,
+    body: BridgeActivateRequest,
+    authenticated: bool = Depends(verify_auth),
+):
+    service = _get_thread_service()
+    try:
+        tab_info = await asyncio.to_thread(
+            service.activate_bridge,
+            normalize_bridge_id(bridge_id),
+            body.thread_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="ChatGPT bridge 或 thread ID 无效") from exc
+    except RuntimeError as exc:
+        raise _translate_service_error(exc) from exc
+    return {
+        "ok": True,
+        "bridge_id": normalize_bridge_id(bridge_id),
+        "thread_id": normalize_thread_id(body.thread_id) if body.thread_id else None,
+        "tab_index": int(tab_info.get("persistent_index") or 0),
+    }
+
+
+@router.delete("/api/chatgpt/bridge/{bridge_id}")
+async def release_chatgpt_bridge(
+    bridge_id: str,
+    authenticated: bool = Depends(verify_auth),
+):
+    service = _get_thread_service()
+    try:
+        released = await asyncio.to_thread(
+            service.release_bridge,
+            normalize_bridge_id(bridge_id),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="ChatGPT bridge ID 无效") from exc
+    except RuntimeError as exc:
+        raise _translate_service_error(exc) from exc
+    return {"ok": True, "released": bool(released)}
+
+
 @router.post("/api/chatgpt/threads/new/v1/chat/completions")
 async def create_chatgpt_thread_completion(
     request: Request,
@@ -135,29 +284,39 @@ async def create_chatgpt_thread_completion(
         )
 
     service = _get_thread_service()
+    bridge_id, ephemeral = _request_bridge(request)
     try:
-        tab_info = await asyncio.to_thread(service.create_new_thread_tab)
+        tab_info = await asyncio.to_thread(
+            service.begin_bridge_request,
+            bridge_id,
+            None,
+        )
         response = await _run_thread_completion(
             tab_info=tab_info,
             request=request,
             body=body,
         )
+        if not isinstance(response, JSONResponse):
+            raise HTTPException(status_code=502, detail="新建网页会话返回了非 JSON 响应")
+        payload = _json_response_payload(response)
+        tab_index = int(tab_info.get("persistent_index") or 0)
+        thread = await asyncio.to_thread(service.get_thread_for_tab, tab_index)
+        if thread is None:
+            raise HTTPException(status_code=502, detail="ChatGPT 首轮完成后未生成 thread ID")
+        enriched_payload = {**payload, "chatgpt_thread": thread}
+        return JSONResponse(
+            content=enriched_payload,
+            status_code=response.status_code,
+            headers=_response_headers_without_content_length(response),
+        )
     except RuntimeError as exc:
         raise _translate_service_error(exc) from exc
-
-    if not isinstance(response, JSONResponse):
-        raise HTTPException(status_code=502, detail="新建网页会话返回了非 JSON 响应")
-    payload = _json_response_payload(response)
-    tab_index = int(tab_info.get("persistent_index") or 0)
-    thread = await asyncio.to_thread(service.get_thread_for_tab, tab_index)
-    if thread is None:
-        raise HTTPException(status_code=502, detail="ChatGPT 首轮完成后未生成 thread ID")
-    enriched_payload = {**payload, "chatgpt_thread": thread}
-    return JSONResponse(
-        content=enriched_payload,
-        status_code=response.status_code,
-        headers=_response_headers_without_content_length(response),
-    )
+    finally:
+        await _finish_bridge_request_quietly(
+            service,
+            bridge_id,
+            ephemeral=ephemeral,
+        )
 
 
 @router.post("/api/chatgpt/threads/{thread_id}/v1/chat/completions")
@@ -171,9 +330,9 @@ async def chat_in_chatgpt_thread(
     effective_body = _latest_user_message_only(body)
     service = _get_thread_service()
     try:
-        tab_info = await asyncio.to_thread(service.ensure_thread_tab, canonical_id)
-        return await _run_thread_completion(
-            tab_info=tab_info,
+        return await _run_bridge_completion(
+            service=service,
+            thread_id=canonical_id,
             request=request,
             body=effective_body,
         )
@@ -190,8 +349,13 @@ async def chat_in_thread_compat(
 ):
     canonical_id = _validated_thread_id(thread_id)
     service = _get_thread_service()
+    bridge_id, ephemeral = _request_bridge(request)
     try:
-        tab_info = await asyncio.to_thread(service.ensure_thread_tab, canonical_id)
+        tab_info = await asyncio.to_thread(
+            service.begin_bridge_request,
+            bridge_id,
+            canonical_id,
+        )
         response = await _run_thread_completion(
             tab_info=tab_info,
             request=request,
@@ -202,16 +366,22 @@ async def chat_in_thread_compat(
             ),
             latest_user_only=True,
         )
+        if not isinstance(response, JSONResponse):
+            raise HTTPException(status_code=502, detail="浏览器返回了非 JSON 响应")
+        payload = _json_response_payload(response)
+        return {
+            "message": _assistant_message(payload),
+            "thread_id": canonical_id,
+            "tab_index": int(tab_info.get("persistent_index") or 0),
+        }
     except RuntimeError as exc:
         raise _translate_service_error(exc) from exc
-    if not isinstance(response, JSONResponse):
-        raise HTTPException(status_code=502, detail="浏览器返回了非 JSON 响应")
-    payload = _json_response_payload(response)
-    return {
-        "message": _assistant_message(payload),
-        "thread_id": canonical_id,
-        "tab_index": int(tab_info.get("persistent_index") or 0),
-    }
+    finally:
+        await _finish_bridge_request_quietly(
+            service,
+            bridge_id,
+            ephemeral=ephemeral,
+        )
 
 
 @router.post("/thread/new", include_in_schema=False)
@@ -221,8 +391,13 @@ async def create_thread_compat(
     authenticated: bool = Depends(verify_auth),
 ):
     service = _get_thread_service()
+    bridge_id, ephemeral = _request_bridge(request)
     try:
-        tab_info = await asyncio.to_thread(service.create_new_thread_tab)
+        tab_info = await asyncio.to_thread(
+            service.begin_bridge_request,
+            bridge_id,
+            None,
+        )
         response = await _run_thread_completion(
             tab_info=tab_info,
             request=request,
@@ -232,17 +407,23 @@ async def create_thread_compat(
                 stream=False,
             ),
         )
+        if not isinstance(response, JSONResponse):
+            raise HTTPException(status_code=502, detail="浏览器返回了非 JSON 响应")
+        payload = _json_response_payload(response)
+        tab_index = int(tab_info.get("persistent_index") or 0)
+        thread = await asyncio.to_thread(service.get_thread_for_tab, tab_index)
+        if thread is None:
+            raise HTTPException(status_code=502, detail="ChatGPT 首轮完成后未生成 thread ID")
+        return {
+            "message": _assistant_message(payload),
+            "thread_id": thread["id"],
+            "tab_index": tab_index,
+        }
     except RuntimeError as exc:
         raise _translate_service_error(exc) from exc
-    if not isinstance(response, JSONResponse):
-        raise HTTPException(status_code=502, detail="浏览器返回了非 JSON 响应")
-    payload = _json_response_payload(response)
-    tab_index = int(tab_info.get("persistent_index") or 0)
-    thread = await asyncio.to_thread(service.get_thread_for_tab, tab_index)
-    if thread is None:
-        raise HTTPException(status_code=502, detail="ChatGPT 首轮完成后未生成 thread ID")
-    return {
-        "message": _assistant_message(payload),
-        "thread_id": thread["id"],
-        "tab_index": tab_index,
-    }
+    finally:
+        await _finish_bridge_request_quietly(
+            service,
+            bridge_id,
+            ephemeral=ephemeral,
+        )

@@ -8,6 +8,7 @@ class FakeSession:
         self.id = "session-7"
         self.persistent_index = 7
         self._url = url
+        self.bridge_owner_id = None
 
     def get_info(self, use_cached_url=False):
         return {
@@ -73,3 +74,34 @@ def test_create_shared_url_tab_registers_valid_shared_cookie_tab():
     assert result["tab"]["tab_route_prefix"] == "/tab/7"
     assert result["tab"]["exact_url_route_prefix"] == "/tab-url/encoded-url"
     assert manager._tabs["session-7"].persistent_index == 7
+
+
+def test_create_bridge_tab_is_background_owned_and_not_a_new_window():
+    manager = make_manager()
+    url = "https://chatgpt.com/c/123e4567-e89b-12d3-a456-426614174000"
+    captured = {}
+
+    def create_shared_tab(target_url, *, background, new_window):
+        captured.update(url=target_url, background=background, new_window=new_window)
+        return {
+            "tab": object(),
+            "raw_tab_id": "raw-7",
+            "browser_context_id": "shared-context",
+            "url": target_url,
+        }
+
+    session = FakeSession(url)
+    manager._create_shared_tab = create_shared_tab
+    manager._wrap_tab = lambda *args, **kwargs: session
+
+    result = manager.create_shared_url_tab(
+        url,
+        expected_domain="chatgpt.com",
+        background=True,
+        new_window=False,
+        owner_id="bridge-owner",
+    )
+
+    assert result["ok"] is True
+    assert captured == {"url": url, "background": True, "new_window": False}
+    assert session.bridge_owner_id == "bridge-owner"

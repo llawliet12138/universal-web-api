@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import threading
@@ -786,6 +787,9 @@ class TabPoolManager:
         url: str,
         *,
         expected_domain: Optional[str] = None,
+        background: bool = False,
+        new_window: bool = True,
+        owner_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Open a validated HTTPS URL in a shared-cookie controlled tab."""
         target_url = str(url or "").strip()
@@ -801,7 +805,11 @@ class TabPoolManager:
             if len(self._tabs) >= self.max_tabs:
                 return {"ok": False, "error": "tab_pool_full"}
 
-        created = self._create_shared_tab(target_url, background=False, new_window=True)
+        created = self._create_shared_tab(
+            target_url,
+            background=bool(background),
+            new_window=bool(new_window),
+        )
         if not created:
             return {"ok": False, "error": "create_shared_tab_failed"}
 
@@ -816,6 +824,15 @@ class TabPoolManager:
                 browser_context_id=created.get("browser_context_id"),
                 is_isolated_context=False,
             )
+            session.bridge_owner_id = str(owner_id or "").strip() or None
+            if session.bridge_owner_id:
+                marker = f"__uwa_chatgpt_bridge__:{session.bridge_owner_id}"
+                try:
+                    session.tab.run_js(
+                        f"window.name = {json.dumps(marker)}; return window.name;"
+                    )
+                except Exception as exc:
+                    logger.debug(f"[{session.id}] bridge marker injection failed: {exc}")
             self._tabs[session.id] = session
             self._start_global_monitor_for_session(session)
             self._last_scan_time = time.time()
@@ -845,6 +862,121 @@ class TabPoolManager:
                 "message": f"已打开共享 Cookie URL: {target_url}",
                 "tab": enriched_info,
             }
+
+    def get_owned_tab_info(self, owner_id: str) -> Optional[Dict[str, Any]]:
+        owner = str(owner_id or "").strip()
+        if not owner:
+            return None
+        with self._condition:
+            if self._should_scan_for_query():
+                self._scan_new_tabs()
+            session = next(
+                (
+                    item
+                    for item in self._tabs.values()
+                    if str(getattr(item, "bridge_owner_id", "") or "") == owner
+                ),
+                None,
+            )
+            if session is None:
+                return None
+            return session.get_info(use_cached_url=True)
+
+    def navigate_owned_tab(
+        self,
+        owner_id: str,
+        url: str,
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        owner = str(owner_id or "").strip()
+        target_url = str(url or "").strip()
+        if not owner or not target_url:
+            return {"ok": False, "error": "invalid_bridge_navigation"}
+
+        deadline = time.time() + max(1.0, float(timeout or 60.0))
+        task_id = f"bridge-nav-{owner}"
+        session = None
+        with self._condition:
+            while True:
+                session = next(
+                    (
+                        item
+                        for item in self._tabs.values()
+                        if str(getattr(item, "bridge_owner_id", "") or "") == owner
+                    ),
+                    None,
+                )
+                if session is None:
+                    return {"ok": False, "error": "bridge_tab_not_found"}
+                if session.status == TabStatus.IDLE and session.acquire_for_command(task_id):
+                    self._detach_global_monitor_for_session(session.id, reason="bridge_navigate")
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return {"ok": False, "error": "bridge_tab_busy"}
+                self._condition.wait(timeout=min(remaining, 0.5))
+
+        try:
+            session.tab.get(target_url)
+            marker = f"__uwa_chatgpt_bridge__:{owner}"
+            try:
+                session.tab.run_js(
+                    f"window.name = {json.dumps(marker)}; return window.name;"
+                )
+            except Exception as exc:
+                logger.debug(f"[{session.id}] bridge marker refresh failed: {exc}")
+            current_url = str(getattr(session.tab, "url", "") or target_url)
+            session._remember_url(current_url)
+            session._refresh_current_domain(current_url)
+        except Exception as exc:
+            session.mark_error(str(exc))
+            return {"ok": False, "error": "bridge_navigation_failed"}
+        finally:
+            self.release(
+                session.id,
+                check_triggers=False,
+                expected_task_id=task_id,
+            )
+
+        return {"ok": True, "tab": session.get_info(use_cached_url=True)}
+
+    def close_owned_tab(self, owner_id: str) -> Dict[str, Any]:
+        owner = str(owner_id or "").strip()
+        if not owner:
+            return {"ok": False, "error": "invalid_bridge_id"}
+
+        raw_ids: List[str] = []
+        with self._condition:
+            session = next(
+                (
+                    item
+                    for item in self._tabs.values()
+                    if str(getattr(item, "bridge_owner_id", "") or "") == owner
+                ),
+                None,
+            )
+            if session is None:
+                return {"ok": True, "closed": False}
+            if session.status == TabStatus.BUSY:
+                return {"ok": False, "error": "bridge_tab_busy"}
+
+            self._detach_global_monitor_for_session(session.id, reason="bridge_close")
+            for raw_id, persistent_idx in list(self._raw_id_to_persistent.items()):
+                if self._persistent_to_session_id.get(persistent_idx) == session.id:
+                    raw_ids.append(raw_id)
+                    self._raw_id_to_persistent.pop(raw_id, None)
+                    self._known_tab_ids.discard(raw_id)
+            if session.persistent_index:
+                self._persistent_to_session_id.pop(session.persistent_index, None)
+            self._tabs.pop(session.id, None)
+            if self._active_session_id == session.id:
+                self._active_session_id = None
+            self._on_session_removed(session.id)
+            self._condition.notify_all()
+
+        for raw_id in raw_ids:
+            self._close_raw_tab(raw_id)
+        return {"ok": True, "closed": bool(raw_ids)}
 
     def _order_sessions_for_allocation(
         self,
@@ -906,6 +1038,8 @@ class TabPoolManager:
             session_id = str(getattr(session, "id", "") or "")
             if session_id in attempted_ids:
                 continue
+            if getattr(session, "bridge_owner_id", None):
+                continue
             if session.status != TabStatus.IDLE:
                 continue
             if not session.is_healthy(allow_live_check=False):
@@ -952,6 +1086,8 @@ class TabPoolManager:
             route_domain=route_domain,
             allocation_mode=mode,
         ):
+            if getattr(session, "bridge_owner_id", None):
+                continue
             if session.status != TabStatus.IDLE:
                 continue
             if not session.is_healthy(allow_live_check=False):
@@ -1464,6 +1600,48 @@ class TabPoolManager:
                 replacement_raw_id = None
                 replacement_tab = None
                 browser_context_id = str(session.browser_context_id or "").strip()
+                bridge_owner_id = str(getattr(session, "bridge_owner_id", "") or "").strip()
+                if bridge_owner_id and session.status == TabStatus.IDLE:
+                    cached_url, _cached_domain = session.get_cached_route_snapshot()
+                    expected_marker = f"__uwa_chatgpt_bridge__:{bridge_owner_id}"
+                    for candidate_raw_id in current_tab_ids:
+                        if candidate_raw_id in reserved_raw_ids:
+                            continue
+                        candidate_tab = self._resolve_tab_from_ref(candidate_raw_id)
+                        if not candidate_tab:
+                            continue
+                        try:
+                            candidate_marker = str(
+                                candidate_tab.run_js("return window.name || '';") or ""
+                            )
+                        except Exception:
+                            candidate_marker = ""
+                        if candidate_marker != expected_marker:
+                            continue
+                        replacement_raw_id = candidate_raw_id
+                        replacement_tab = candidate_tab
+                        break
+
+                if bridge_owner_id and replacement_raw_id and replacement_tab:
+                    self._detach_global_monitor_for_session(session_id, reason="bridge_target_rebind")
+                    persistent_idx = self._raw_id_to_persistent.pop(raw_id, None) if raw_id else None
+                    if persistent_idx is None:
+                        persistent_idx = int(getattr(session, "persistent_index", 0) or 0) or None
+                    if persistent_idx is not None:
+                        self._raw_id_to_persistent[replacement_raw_id] = persistent_idx
+                        self._persistent_to_session_id[persistent_idx] = session_id
+                    if raw_id:
+                        self._known_tab_ids.discard(raw_id)
+                    self._known_tab_ids.add(replacement_raw_id)
+                    session.tab = replacement_tab
+                    session._remember_url(str(getattr(replacement_tab, "url", "") or cached_url))
+                    reserved_raw_ids.add(replacement_raw_id)
+                    self._start_global_monitor_for_session(session)
+                    logger.info(
+                        f"[{session_id}] rebound bridge target: {raw_id} -> {replacement_raw_id}"
+                    )
+                    changed = True
+                    continue
                 if session.is_isolated_context and browser_context_id:
                     for candidate_raw_id in current_tab_ids:
                         if candidate_raw_id in reserved_raw_ids:
@@ -2178,6 +2356,8 @@ class TabPoolManager:
 
         matches: List[TabSession] = []
         for session in self._tabs.values():
+            if getattr(session, "bridge_owner_id", None):
+                continue
             current_url, actual_domain = session.get_cached_route_snapshot()
             if route_domain_matches(target, actual_domain):
                 if self.is_url_excluded(current_url):
@@ -2338,6 +2518,8 @@ class TabPoolManager:
 
         matches: List[TabSession] = []
         for session in self._tabs.values():
+            if getattr(session, "bridge_owner_id", None):
+                continue
             current_url, _actual_domain = session.get_cached_route_snapshot()
             if tab_url_matches(target, current_url):
                 matches.append(session)

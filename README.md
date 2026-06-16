@@ -37,6 +37,7 @@ The following capabilities were added by this fork and **are not part of the ups
 | **Terminal client** | Select, create, switch, and continue web conversations without returning to the site | `chatgpt_cli.py` |
 | **Obsidian integration** | Uses each real web thread as an independent OpenAI Base URL | `/api/chatgpt/threads/<id>/v1` |
 | **Thread safety checks** | Fast 401 for logged-out sessions, 404 for wrong threads, and latest-user-message-only continuation | `app/api/chatgpt_thread_routes.py` |
+| **Controlled-browser startup shortcuts** | `python3 start.py --site chatgpt` skips the controlled-browser guide and opens supported AI sites directly | `start.py`, `main.py` |
 | **macOS launch fix** | Starts a separate controlled Chrome instance and binds debugging to localhost | `start.py` |
 | **Fork update protection** | Disables upstream auto-update by default so fork changes are not overwritten | `.env.example`, `start.py` |
 | **Additional verification** | Tests for thread services, APIs, CLI, browser startup, and security boundaries | `tests/test_*` |
@@ -100,8 +101,10 @@ graph TD
 2. **Start the Service**:
    * **Windows**: Double-click **`start.bat`**.
    * **macOS / Linux**: Run **`python3 start.py`** in your terminal.
-3. **Initialization**: Once dependencies are validated and installed, a controlled browser window will pop up automatically, and the console will open in a normal browser at `http://127.0.0.1:8199`. Keep AI websites in the controlled browser, and use your normal browser for the dashboard and tutorial.
-4. **Log In**: In the controlled browser, log in to your own AI web accounts (e.g., chatgpt.com, claude.ai), then keep the target site on a real chat-ready page.
+   * **Added by this fork**: use `--site` to open a supported AI site directly in the controlled browser, for example **`python3 start.py --site chatgpt`**, **`python3 start.py --site grok`**, or **`python3 start.py --first --site chatgpt`**. `--first` only controls whether the tutorial opens in the system default browser.
+   * By default the controlled Chrome starts quietly without taking focus where supported; use **`python3 start.py --login --site chatgpt`** when you need the browser in front for login.
+3. **Initialization**: Once dependencies are validated and installed, the service starts a controlled browser and opens the console in a normal browser at `http://127.0.0.1:8199`. Keep AI websites in the controlled browser, and use your normal browser for the dashboard and tutorial.
+4. **Log In**: When login is needed, start with `--login`, log in to your own AI web accounts (e.g., chatgpt.com, claude.ai) in the foreground controlled browser, then keep the target site on a real chat-ready page.
 5. **Configure Clients**: In any client, set the API configurations:
    * **Base URL**: `http://127.0.0.1:8199/v1`
    * **API Key**: If auth token verification is disabled, use any value (e.g., `sk-local`). If enabled, use your custom configured token.
@@ -130,6 +133,8 @@ cd universal-web-api
 python3 chatgpt_cli.py
 ```
 
+This fork now gives each CLI client one hidden background bridge tab. Conversation switches reuse that tab instead of opening new windows. `/exit`, Ctrl+C, and EOF close it immediately; abandoned tabs are reclaimed after 30 idle minutes. User-opened ChatGPT tabs are used only for login and thread discovery and are never navigated or closed by the bridge.
+
 Troubleshooting:
 
 - `Cannot connect to local service`: Terminal 1 is not running `python3 start.py`, or the service exited.
@@ -144,6 +149,14 @@ API Key:  Any value, or AUTH_TOKEN when authentication is enabled
 Model:    web-browser
 ```
 
+Clients that support custom headers should generate one UUID and send it on every request:
+
+```text
+X-ChatGPT-Bridge-ID: <client-uuid>
+```
+
+They may explicitly activate a thread with `POST /api/chatgpt/bridge/<client-uuid>/activate` and JSON `{"thread_id":"<thread-id>"}`, then release it with `DELETE /api/chatgpt/bridge/<client-uuid>`. Clients that cannot set custom headers remain compatible: each request receives a temporary hidden tab that is closed after the response, including after a streaming response finishes.
+
 Useful endpoints:
 
 ```text
@@ -153,9 +166,13 @@ POST /api/chatgpt/threads/new/v1/chat/completions
 GET  /threads
 POST /thread/{thread-id}/chat
 POST /thread/new
+POST /api/chatgpt/bridge/<bridge-id>/activate
+DELETE /api/chatgpt/bridge/<bridge-id>
 ```
 
 Creating a conversation only supports `stream=false`, because the web thread ID is not available until the first response completes. Existing conversations support streaming and send only the latest `user` message from an OpenAI request; the web conversation remains the source of truth for history. A `401 chatgpt_login_required` response means the controlled browser must be logged in. Keep the service bound to localhost and enable `AUTH_ENABLED` if other local applications can reach the port.
+
+The default idle lease timeout is 1800 seconds and can be changed with `CHATGPT_BRIDGE_TTL_SEC`. Releasing a bridge closes only bridge-owned tabs, not the controlled Chrome process or user-opened pages.
 
 ---
 

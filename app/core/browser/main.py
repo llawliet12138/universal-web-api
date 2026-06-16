@@ -100,7 +100,7 @@ class BrowserCore(
         self._watchdog_thread = None
         
         if self._tab_pool:
-            self._tab_pool.shutdown()
+            self._tab_pool.shutdown(close_browser_tabs=False)
             self._tab_pool = None
         
         self._connected = False

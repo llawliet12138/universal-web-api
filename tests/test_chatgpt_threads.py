@@ -1,9 +1,12 @@
 import json
+import time
+import threading
 import unittest
 from pathlib import Path
 
 from app.services.chatgpt_threads import (
     CHATGPT_CONTINUE_PRESET,
+    ChatGPTBridgeRegistry,
     ChatGPTThreadService,
     extract_thread_id,
     normalize_thread_candidates,
@@ -49,6 +52,8 @@ class FakeTabPool:
         self.actual_url = actual_url
         self.created_urls = []
         self.released = []
+        self.closed_owners = []
+        self.navigated = []
 
     def get_tabs_with_index(self):
         return list(self.tabs)
@@ -69,8 +74,18 @@ class FakeTabPool:
     def release(self, session_id, **kwargs):
         self.released.append((session_id, kwargs))
 
-    def create_shared_url_tab(self, url, expected_domain=None):
-        self.created_urls.append((url, expected_domain))
+    def create_shared_url_tab(
+        self,
+        url,
+        expected_domain=None,
+        *,
+        background=False,
+        new_window=True,
+        owner_id=None,
+    ):
+        self.created_urls.append(
+            (url, expected_domain, background, new_window, owner_id)
+        )
         return {
             "ok": True,
             "tab": {
@@ -80,9 +95,35 @@ class FakeTabPool:
             },
         }
 
+    def get_owned_tab_info(self, owner_id):
+        for url, _domain, _background, _new_window, created_owner in reversed(self.created_urls):
+            if created_owner == owner_id:
+                return {
+                    "persistent_index": 7,
+                    "url": url,
+                    "current_domain": "chatgpt.com",
+                }
+        return None
+
+    def navigate_owned_tab(self, owner_id, url, timeout=None):
+        self.navigated.append((owner_id, url))
+        self.actual_url = url
+        return {
+            "ok": True,
+            "tab": {
+                "persistent_index": 7,
+                "url": url,
+                "current_domain": "chatgpt.com",
+            },
+        }
+
+    def close_owned_tab(self, owner_id):
+        self.closed_owners.append(owner_id)
+        return {"ok": True, "closed": True}
+
 
 class FailingTabPool(FakeTabPool):
-    def create_shared_url_tab(self, url, expected_domain=None):
+    def create_shared_url_tab(self, url, expected_domain=None, **kwargs):
         return {"ok": False, "error": "tab_pool_full"}
 
 
@@ -127,6 +168,7 @@ class ChatGPTThreadParsingTests(unittest.TestCase):
                     "id": THREAD_ID,
                     "title": "First conversation",
                     "url": f"https://chatgpt.com/c/{THREAD_ID}",
+                    "is_pinned": False,
                 }
             ],
         )
@@ -158,7 +200,7 @@ class ChatGPTThreadServiceTests(unittest.TestCase):
                 }
             ],
             sidebar_items=[
-                {"href": f"/c/{THREAD_ID}", "title": "Sidebar title"},
+                {"href": f"/c/{THREAD_ID}", "title": "Sidebar title", "is_pinned": True},
                 {"href": f"/c/{second_id}", "title": "Second"},
             ],
         )
@@ -168,7 +210,9 @@ class ChatGPTThreadServiceTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in result], [THREAD_ID, second_id])
         self.assertEqual(result[0]["tab_index"], 2)
         self.assertTrue(result[0]["is_open"])
+        self.assertTrue(result[0]["is_pinned"])
         self.assertEqual(result[1]["tab_index"], None)
+        self.assertFalse(result[1]["is_pinned"])
         self.assertTrue(pool.released)
 
     def test_ensure_thread_tab_reuses_an_open_conversation(self):
@@ -195,7 +239,7 @@ class ChatGPTThreadServiceTests(unittest.TestCase):
         self.assertEqual(result["persistent_index"], 7)
         self.assertEqual(
             pool.created_urls,
-            [(f"https://chatgpt.com/c/{THREAD_ID}", "chatgpt.com")],
+            [(f"https://chatgpt.com/c/{THREAD_ID}", "chatgpt.com", True, False, None)],
         )
 
     def test_thread_tab_creation_errors_are_propagated(self):
@@ -246,6 +290,77 @@ class ChatGPTThreadServiceTests(unittest.TestCase):
 
     def test_continue_preset_name_is_stable_for_api_clients(self):
         self.assertEqual(CHATGPT_CONTINUE_PRESET, "继续当前会话")
+
+
+class ChatGPTBridgeRegistryTests(unittest.TestCase):
+    def test_bridge_uses_one_background_tab_and_navigates_it_on_switch(self):
+        pool = FakeTabPool()
+        registry = ChatGPTBridgeRegistry(ttl_seconds=1800, start_cleaner=False)
+        service = ChatGPTThreadService(FakeBrowser(pool), bridge_registry=registry)
+        bridge_id = "323e4567-e89b-12d3-a456-426614174002"
+        second_id = "423e4567-e89b-12d3-a456-426614174003"
+
+        first = service.activate_bridge(bridge_id, THREAD_ID)
+        second = service.activate_bridge(bridge_id, second_id)
+
+        self.assertEqual(first["persistent_index"], second["persistent_index"])
+        self.assertEqual(len(pool.created_urls), 1)
+        self.assertEqual(
+            pool.created_urls[0],
+            (f"https://chatgpt.com/c/{THREAD_ID}", "chatgpt.com", True, False, bridge_id),
+        )
+        self.assertEqual(pool.navigated, [(bridge_id, f"https://chatgpt.com/c/{second_id}")])
+
+    def test_different_bridge_ids_get_different_owned_tabs(self):
+        pool = FakeTabPool()
+        registry = ChatGPTBridgeRegistry(ttl_seconds=1800, start_cleaner=False)
+        service = ChatGPTThreadService(FakeBrowser(pool), bridge_registry=registry)
+
+        service.activate_bridge("523e4567-e89b-12d3-a456-426614174004", THREAD_ID)
+        service.activate_bridge("623e4567-e89b-12d3-a456-426614174005", THREAD_ID)
+
+        self.assertEqual(len(pool.created_urls), 2)
+        self.assertNotEqual(pool.created_urls[0][-1], pool.created_urls[1][-1])
+
+    def test_release_and_expiry_close_only_owned_bridge_tabs(self):
+        pool = FakeTabPool()
+        registry = ChatGPTBridgeRegistry(ttl_seconds=1, start_cleaner=False)
+        service = ChatGPTThreadService(FakeBrowser(pool), bridge_registry=registry)
+        bridge_id = "723e4567-e89b-12d3-a456-426614174006"
+        expired_id = "823e4567-e89b-12d3-a456-426614174007"
+
+        service.activate_bridge(bridge_id, THREAD_ID)
+        service.release_bridge(bridge_id)
+        service.activate_bridge(expired_id, THREAD_ID)
+        registry._leases[expired_id].last_activity = time.time() - 2
+        registry.cleanup_expired(pool)
+
+        self.assertEqual(pool.closed_owners, [bridge_id, expired_id])
+
+    def test_switch_waits_until_active_request_finishes(self):
+        pool = FakeTabPool()
+        registry = ChatGPTBridgeRegistry(ttl_seconds=1800, start_cleaner=False)
+        service = ChatGPTThreadService(FakeBrowser(pool), bridge_registry=registry)
+        bridge_id = "c23e4567-e89b-12d3-a456-426614174011"
+        second_id = "d23e4567-e89b-12d3-a456-426614174012"
+        service.begin_bridge_request(bridge_id, THREAD_ID)
+        switched = threading.Event()
+
+        def switch_thread():
+            service.activate_bridge(bridge_id, second_id)
+            switched.set()
+
+        worker = threading.Thread(target=switch_thread)
+        worker.start()
+        time.sleep(0.05)
+        self.assertFalse(switched.is_set())
+        self.assertEqual(pool.navigated, [])
+
+        service.end_bridge_request(bridge_id)
+        worker.join(timeout=1.0)
+
+        self.assertTrue(switched.is_set())
+        self.assertEqual(pool.navigated[-1], (bridge_id, f"https://chatgpt.com/c/{second_id}"))
 
 
 if __name__ == "__main__":

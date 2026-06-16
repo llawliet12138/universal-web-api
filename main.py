@@ -14,12 +14,14 @@ import sys
 import threading
 import time
 import webbrowser
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 from urllib.request import urlopen
 from pathlib import Path
 from contextlib import asynccontextmanager
 from app import __version__ as APP_VERSION
 from app.core import get_browser
+from terminal_display import get_terminal_display
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +29,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, Response
 # ================= 导入配置 =================
 
-from app.core.config import AppConfig, get_logger, get_shared_file_log_handler
+from app.core.config import (
+    AppConfig,
+    configure_root_console_logging,
+    get_logger,
+    get_shared_file_log_handler,
+)
 
 # ================= 日志配置 =================
 
@@ -39,6 +46,7 @@ logging.basicConfig(
 )
 
 _root_logger = logging.getLogger()
+configure_root_console_logging(_root_logger)
 _root_file_handler = get_shared_file_log_handler()
 if _root_file_handler is not None and all(
     handler is not _root_file_handler for handler in _root_logger.handlers
@@ -145,6 +153,100 @@ def _resolve_local_startup_host() -> str:
 
 def _get_local_startup_base_url() -> str:
     return f"http://{_resolve_local_startup_host()}:{AppConfig.get_port()}"
+
+
+def _should_open_default_browser_guide() -> bool:
+    raw = str(os.getenv("OPEN_DEFAULT_BROWSER_GUIDE", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on", "first"}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _controlled_browser_login_mode() -> bool:
+    return _env_flag("CONTROLLED_BROWSER_LOGIN_MODE")
+
+
+def _controlled_browser_background_mode() -> bool:
+    return not _controlled_browser_login_mode()
+
+
+def _split_controlled_browser_startup_site_tokens(raw: Optional[str] = None) -> List[str]:
+    text = os.getenv("CONTROLLED_BROWSER_STARTUP_SITES", "") if raw is None else str(raw or "")
+    tokens: List[str] = []
+    seen = set()
+    for item in text.replace(";", ",").split(","):
+        token = str(item or "").strip()
+        lowered = token.lower()
+        if not token or lowered in {"first"} or lowered in seen:
+            continue
+        seen.add(lowered)
+        tokens.append(token)
+    return tokens
+
+
+def _normalize_startup_site_lookup_key(value: Any) -> str:
+    text = str(value or "").strip().lower().strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        parsed = urlparse(text)
+        text = parsed.hostname or text
+    if "/" in text:
+        text = text.split("/", 1)[0]
+    return text.strip().strip(".")
+
+
+def _resolve_controlled_browser_startup_targets(raw: Optional[str] = None) -> List[Dict[str, str]]:
+    tokens = _split_controlled_browser_startup_site_tokens(raw)
+    if not tokens:
+        return []
+
+    from app.services.config_engine import config_engine
+
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for site in config_engine.list_site_catalog():
+        if not isinstance(site, dict):
+            continue
+        keys = [
+            site.get("domain"),
+            site.get("card_id"),
+            site.get("display_name"),
+            *(site.get("route_aliases") or []),
+        ]
+        for key in keys:
+            normalized = _normalize_startup_site_lookup_key(key)
+            if normalized and normalized not in lookup:
+                lookup[normalized] = site
+
+    targets: List[Dict[str, str]] = []
+    unknown: List[str] = []
+    seen_domains = set()
+    for token in tokens:
+        normalized = _normalize_startup_site_lookup_key(token)
+        site = lookup.get(normalized)
+        if not site:
+            unknown.append(token)
+            continue
+
+        domain = str(site.get("domain") or "").strip()
+        if not domain or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        url = str(site.get("url") or "").strip() or f"https://{domain}"
+        targets.append({
+            "domain": domain,
+            "name": str(site.get("display_name") or domain).strip() or domain,
+            "url": url,
+        })
+
+    if unknown:
+        logger.warning(f"[startup] 未识别的受控浏览器启动站点: {', '.join(unknown)}")
+    return targets
 
 
 def _count_existing_remote_pages(browser) -> int:
@@ -275,8 +377,8 @@ def _open_controlled_browser_page_non_blocking(
                     try:
                         target_tab = browser.get_browser_handle().new_tab(
                             url=page_url,
-                            background=False,
-                            new_window=True,
+                            background=_controlled_browser_background_mode(),
+                            new_window=_controlled_browser_login_mode(),
                         )
                         logger.info(f"[startup] {page_name}已在受控浏览器新标签页打开: {page_url}")
                         return
@@ -299,6 +401,70 @@ def _open_controlled_browser_page_non_blocking(
         target=_worker,
         daemon=True,
         name="open-controlled-browser-page-non-blocking",
+    ).start()
+
+
+def _open_controlled_browser_startup_sites_non_blocking(
+    browser,
+    targets: List[Dict[str, str]],
+    initial_delay_sec: float = 0.8,
+    startup_blank_tab_id: str = "",
+):
+    """Open explicit startup sites in the controlled browser without using the guide page."""
+
+    def _worker():
+        try:
+            time.sleep(max(0.0, float(initial_delay_sec)))
+
+            first_target_tab = None
+            startup_tab_id = str(startup_blank_tab_id or "").strip()
+            if startup_tab_id:
+                try:
+                    candidate = browser.get_tab(startup_tab_id)
+                    if _get_tab_url(candidate) in _STARTUP_EMPTY_URLS:
+                        first_target_tab = candidate
+                    else:
+                        logger.info("[startup] 启动空白页已被使用，将为启动站点新建标签页")
+                except Exception:
+                    logger.info("[startup] 启动空白页已不存在，将为启动站点新建标签页")
+
+            for index, target in enumerate(targets):
+                page_url = str((target or {}).get("url") or "").strip()
+                page_name = str((target or {}).get("name") or page_url).strip() or page_url
+                if not page_url:
+                    continue
+
+                if index == 0 and first_target_tab is not None:
+                    first_target_tab.get(page_url)
+                    logger.info(f"[startup] {page_name}已在受控浏览器打开: {page_url}")
+                    continue
+
+                opened = False
+                try:
+                    browser.get_browser_handle().new_tab(
+                        url=page_url,
+                        background=_controlled_browser_background_mode(),
+                        new_window=False,
+                    )
+                    opened = True
+                    logger.info(f"[startup] {page_name}已在受控浏览器新标签页打开: {page_url}")
+                except Exception:
+                    opened = False
+
+                if not opened:
+                    try:
+                        tab = browser.get_latest_tab()
+                        tab.get(page_url)
+                        logger.info(f"[startup] {page_name}已在受控浏览器打开: {page_url}")
+                    except Exception as e:
+                        logger.warning(f"[startup] 打开{page_name}失败: {e}")
+        except Exception as e:
+            logger.warning(f"[startup] 打开启动站点失败: {e}")
+
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name="open-controlled-browser-startup-sites-non-blocking",
     ).start()
 
 
@@ -401,34 +567,54 @@ async def lifespan(app: FastAPI):
     
         if health["connected"]:
             startup_blank_tab_id = _capture_startup_blank_tab_id(browser)
-            if _should_open_startup_pages(browser):
+            startup_targets = _resolve_controlled_browser_startup_targets()
+            should_open_startup_pages = bool(startup_targets) or _should_open_startup_pages(browser)
+            if should_open_startup_pages:
                 try:
                     base_url = _get_local_startup_base_url()
                     tutorial_url = f"{base_url}/static/tutorial/index.html"
                     guide_url = f"{base_url}/static/controlled-browser-guide.html"
-                    logger.info(f"[startup] 首次启动，使用系统浏览器打开教程页: {tutorial_url}")
-                    _open_startup_page_non_blocking(
-                        tutorial_url,
-                        page_name="教程页",
-                        initial_delay_sec=1.2,
-                    )
-                    logger.info(f"[startup] 首次启动，准备在受控浏览器打开引导页: {guide_url}")
-                    _open_controlled_browser_page_non_blocking(
-                        browser,
-                        guide_url,
-                        page_name="受控浏览器引导页",
-                        initial_delay_sec=0.8,
-                        startup_blank_tab_id=startup_blank_tab_id,
-                    )
+                    if _should_open_default_browser_guide():
+                        logger.info(f"[startup] first 参数已启用，使用系统浏览器打开教程页: {tutorial_url}")
+                        _open_startup_page_non_blocking(
+                            tutorial_url,
+                            page_name="教程页",
+                            initial_delay_sec=1.2,
+                        )
+                    else:
+                        logger.info("[startup] 未传入 first，跳过系统默认浏览器教程页")
+                    if startup_targets:
+                        target_names = ", ".join(
+                            str(target.get("domain") or target.get("name") or target.get("url"))
+                            for target in startup_targets
+                        )
+                        logger.info(f"[startup] 准备在受控浏览器打开启动站点: {target_names}")
+                        _open_controlled_browser_startup_sites_non_blocking(
+                            browser,
+                            startup_targets,
+                            initial_delay_sec=0.8,
+                            startup_blank_tab_id=startup_blank_tab_id,
+                        )
+                    elif _controlled_browser_login_mode():
+                        logger.info(f"[startup] 首次启动，准备在受控浏览器打开引导页: {guide_url}")
+                        _open_controlled_browser_page_non_blocking(
+                            browser,
+                            guide_url,
+                            page_name="受控浏览器引导页",
+                            initial_delay_sec=0.8,
+                            startup_blank_tab_id=startup_blank_tab_id,
+                        )
+                    else:
+                        logger.info("[startup] 静默模式已启用，跳过受控浏览器引导页；需要登录请使用 --login")
                 except Exception as e:
-                    logger.warning(f"⚠️ 无法打开教程页: {e}")
+                    logger.warning(f"⚠️ 无法打开启动页: {e}")
             else:
                 # 显示已连接状态
                 try:
                     existing_tab_count = _count_existing_remote_pages(browser)
                 except Exception:
                     existing_tab_count = "?"
-                logger.info(f"✅ 浏览器已连接 (检测到 {existing_tab_count} 个现有网页，跳过教程)")
+                logger.info(f"✅ 浏览器已连接 (检测到 {existing_tab_count} 个现有网页，跳过启动引导)")
         else:
             logger.warning(f"⚠️ 浏览器未连接: {health.get('error', '未知')}")
         
@@ -469,6 +655,12 @@ async def lifespan(app: FastAPI):
         background_image_downloader.shutdown()
     except Exception as e:
         logger.debug(f"关闭后台图片下载器: {e}")
+
+    try:
+        from app.services.chatgpt_threads import shutdown_chatgpt_bridges
+        shutdown_chatgpt_bridges()
+    except Exception as e:
+        logger.debug(f"关闭 ChatGPT 桥接标签页: {e}")
 
     try:
         browser = get_browser(auto_connect=False)
@@ -771,18 +963,24 @@ async def internal_error_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
 
-    print("\n" + "=" * 60)
-    print("环境变量配置（可选）:")
-    print("  APP_HOST=0.0.0.0          # 监听地址")
-    print("  APP_PORT=8199             # 监听端口")
-    print("  APP_DEBUG=true            # 调试模式")
-    print("  BROWSER_PORT=9222         # 浏览器端口")
-    print("=" * 60 + "\n")
+    display = get_terminal_display()
+    display.permanent("")
+    display.permanent("=" * 60)
+    display.permanent("环境变量配置（可选）:")
+    display.permanent("  APP_HOST=0.0.0.0          # 监听地址")
+    display.permanent("  APP_PORT=8199             # 监听端口")
+    display.permanent("  APP_DEBUG=true            # 调试模式")
+    display.permanent("  BROWSER_PORT=9222         # 浏览器端口")
+    display.permanent("=" * 60)
+    display.permanent("")
 
-    uvicorn.run(
-        app,
-        host=AppConfig.get_host(),
-        port=AppConfig.get_port(),
-        log_level="warning",  # 隐藏 uvicorn 的 INFO 日志
-        access_log=False
-    )
+    try:
+        uvicorn.run(
+            app,
+            host=AppConfig.get_host(),
+            port=AppConfig.get_port(),
+            log_level="warning",  # 隐藏 uvicorn 的 INFO 日志
+            access_log=False
+        )
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise SystemExit(0)

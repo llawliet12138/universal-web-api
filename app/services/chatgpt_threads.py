@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
+import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urljoin, urlsplit
 
@@ -19,16 +22,32 @@ _THREAD_PATH_RE = re.compile(
 
 _SIDEBAR_THREAD_SCRIPT = r"""
 return Array.from(document.querySelectorAll('a[href^="/c/"]'))
-    .map((anchor) => ({
-        href: anchor.getAttribute('href') || '',
-        title: (
+    .map((anchor) => {
+        const title = (
             anchor.innerText ||
             anchor.textContent ||
             anchor.getAttribute('title') ||
             anchor.getAttribute('aria-label') ||
             ''
-        ).trim()
-    }));
+        ).trim();
+        const nearby = [];
+        let node = anchor;
+        for (let i = 0; i < 5 && node; i += 1) {
+            nearby.push(
+                node.getAttribute?.('aria-label') || '',
+                node.getAttribute?.('title') || '',
+                node.getAttribute?.('data-testid') || '',
+                node.className || ''
+            );
+            node = node.parentElement;
+        }
+        const haystack = nearby.join(' ').toLowerCase();
+        return {
+            href: anchor.getAttribute('href') || '',
+            title,
+            is_pinned: /pinned|pin-|置顶|已固定|固定/.test(haystack)
+        };
+    });
 """
 
 _LOGIN_REQUIRED_SCRIPT = r"""
@@ -38,6 +57,223 @@ return Boolean(document.querySelector(
 """
 
 _THREAD_OPEN_LOCK = threading.Lock()
+
+
+def normalize_bridge_id(value: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        return str(uuid.UUID(raw))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError("invalid_chatgpt_bridge_id") from exc
+
+
+@dataclass
+class _BridgeLease:
+    bridge_id: str
+    pool: Any
+    persistent_index: int
+    current_url: str
+    thread_id: Optional[str]
+    last_activity: float
+    active_requests: int = 0
+
+
+class ChatGPTBridgeRegistry:
+    """Own one hidden ChatGPT worker tab per local client bridge ID."""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 1800.0,
+        cleanup_interval: float = 60.0,
+        start_cleaner: bool = True,
+    ):
+        self.ttl_seconds = max(1.0, float(ttl_seconds))
+        self.cleanup_interval = max(1.0, float(cleanup_interval))
+        self._condition = threading.Condition(threading.RLock())
+        self._leases: Dict[str, _BridgeLease] = {}
+        self._stop_event = threading.Event()
+        self._cleaner_thread: Optional[threading.Thread] = None
+        if start_cleaner:
+            self._cleaner_thread = threading.Thread(
+                target=self._cleanup_loop,
+                name="chatgpt-bridge-cleaner",
+                daemon=True,
+            )
+            self._cleaner_thread.start()
+
+    def _wait_until_idle(self, bridge_id: str, timeout: float = 600.0) -> None:
+        deadline = time.time() + max(1.0, float(timeout))
+        while True:
+            lease = self._leases.get(bridge_id)
+            if lease is None or lease.active_requests <= 0:
+                return
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise RuntimeError("chatgpt_bridge_busy")
+            self._condition.wait(timeout=min(remaining, 1.0))
+
+    def _ensure_tab_locked(
+        self,
+        pool: Any,
+        bridge_id: str,
+        target_url: str,
+        thread_id: Optional[str],
+    ) -> Dict[str, Any]:
+        lease = self._leases.get(bridge_id)
+        if lease is not None and lease.pool is not pool:
+            self._leases.pop(bridge_id, None)
+            lease = None
+
+        existing = pool.get_owned_tab_info(bridge_id) if lease is not None else None
+        if lease is not None and existing is None:
+            self._leases.pop(bridge_id, None)
+            try:
+                pool.close_owned_tab(bridge_id)
+            except Exception:
+                pass
+            lease = None
+
+        if lease is None:
+            result = pool.create_shared_url_tab(
+                target_url,
+                expected_domain=CHATGPT_DOMAIN,
+                background=True,
+                new_window=False,
+                owner_id=bridge_id,
+            )
+            if not result.get("ok") or not isinstance(result.get("tab"), dict):
+                raise RuntimeError(str(result.get("error") or "create_chatgpt_bridge_tab_failed"))
+            tab_info = dict(result["tab"])
+            persistent_index = int(tab_info.get("persistent_index") or 0)
+            if persistent_index < 1:
+                raise RuntimeError("chatgpt_tab_unavailable")
+            lease = _BridgeLease(
+                bridge_id=bridge_id,
+                pool=pool,
+                persistent_index=persistent_index,
+                current_url=target_url,
+                thread_id=thread_id,
+                last_activity=time.time(),
+            )
+            self._leases[bridge_id] = lease
+            return tab_info
+
+        tab_info = dict(existing)
+        if lease.current_url != target_url:
+            result = pool.navigate_owned_tab(bridge_id, target_url, timeout=600.0)
+            if not result.get("ok") or not isinstance(result.get("tab"), dict):
+                raise RuntimeError(str(result.get("error") or "chatgpt_bridge_navigation_failed"))
+            tab_info = dict(result["tab"])
+        lease.persistent_index = int(tab_info.get("persistent_index") or lease.persistent_index)
+        lease.current_url = target_url
+        lease.thread_id = thread_id
+        lease.last_activity = time.time()
+        return tab_info
+
+    def activate(
+        self,
+        pool: Any,
+        bridge_id: str,
+        target_url: str,
+        thread_id: Optional[str],
+    ) -> Dict[str, Any]:
+        canonical_id = normalize_bridge_id(bridge_id)
+        with self._condition:
+            self._wait_until_idle(canonical_id)
+            return self._ensure_tab_locked(pool, canonical_id, target_url, thread_id)
+
+    def begin_request(
+        self,
+        pool: Any,
+        bridge_id: str,
+        target_url: str,
+        thread_id: Optional[str],
+    ) -> Dict[str, Any]:
+        canonical_id = normalize_bridge_id(bridge_id)
+        with self._condition:
+            self._wait_until_idle(canonical_id)
+            tab_info = self._ensure_tab_locked(pool, canonical_id, target_url, thread_id)
+            lease = self._leases[canonical_id]
+            lease.active_requests += 1
+            lease.last_activity = time.time()
+            return tab_info
+
+    def end_request(self, bridge_id: str) -> None:
+        canonical_id = normalize_bridge_id(bridge_id)
+        with self._condition:
+            lease = self._leases.get(canonical_id)
+            if lease is not None:
+                lease.active_requests = max(0, lease.active_requests - 1)
+                lease.last_activity = time.time()
+            self._condition.notify_all()
+
+    def release(self, pool: Any, bridge_id: str) -> bool:
+        canonical_id = normalize_bridge_id(bridge_id)
+        with self._condition:
+            self._wait_until_idle(canonical_id)
+            lease = self._leases.pop(canonical_id, None)
+        if lease is None:
+            return False
+        result = pool.close_owned_tab(canonical_id)
+        if not result.get("ok"):
+            with self._condition:
+                self._leases[canonical_id] = lease
+            raise RuntimeError(str(result.get("error") or "chatgpt_bridge_close_failed"))
+        return bool(result.get("closed"))
+
+    def cleanup_expired(self, pool: Any = None) -> int:
+        now = time.time()
+        expired: List[_BridgeLease] = []
+        with self._condition:
+            for bridge_id, lease in list(self._leases.items()):
+                if pool is not None and lease.pool is not pool:
+                    continue
+                if lease.active_requests > 0 or now - lease.last_activity < self.ttl_seconds:
+                    continue
+                expired.append(self._leases.pop(bridge_id))
+        for lease in expired:
+            try:
+                result = lease.pool.close_owned_tab(lease.bridge_id)
+                if not result.get("ok"):
+                    with self._condition:
+                        lease.last_activity = time.time()
+                        self._leases[lease.bridge_id] = lease
+            except Exception:
+                with self._condition:
+                    lease.last_activity = time.time()
+                    self._leases[lease.bridge_id] = lease
+        return len(expired)
+
+    def shutdown(self) -> None:
+        self._stop_event.set()
+        thread = self._cleaner_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        with self._condition:
+            leases = list(self._leases.values())
+            self._leases.clear()
+        for lease in leases:
+            try:
+                lease.pool.close_owned_tab(lease.bridge_id)
+            except Exception:
+                pass
+
+    def _cleanup_loop(self) -> None:
+        while not self._stop_event.wait(self.cleanup_interval):
+            self.cleanup_expired()
+
+
+try:
+    _BRIDGE_TTL_SECONDS = float(os.getenv("CHATGPT_BRIDGE_TTL_SEC", "1800"))
+except ValueError:
+    _BRIDGE_TTL_SECONDS = 1800.0
+
+chatgpt_bridge_registry = ChatGPTBridgeRegistry(ttl_seconds=_BRIDGE_TTL_SECONDS)
+
+
+def shutdown_chatgpt_bridges() -> None:
+    chatgpt_bridge_registry.shutdown()
 
 
 def normalize_thread_id(value: str) -> str:
@@ -74,9 +310,9 @@ def extract_thread_id(url: str) -> Optional[str]:
         return None
 
 
-def normalize_thread_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
+def normalize_thread_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize sidebar links and discard invalid or duplicate entries."""
-    threads: Dict[str, Dict[str, str]] = {}
+    threads: Dict[str, Dict[str, Any]] = {}
     for item in items or []:
         if not isinstance(item, dict):
             continue
@@ -92,6 +328,7 @@ def normalize_thread_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[st
             "id": thread_id,
             "title": title or "Untitled conversation",
             "url": thread_url(thread_id),
+            "is_pinned": bool(item.get("is_pinned") or item.get("pinned")),
         }
     return list(threads.values())
 
@@ -99,8 +336,14 @@ def normalize_thread_candidates(items: Iterable[Dict[str, Any]]) -> List[Dict[st
 class ChatGPTThreadService:
     """Manage ChatGPT conversation tabs without owning response execution."""
 
-    def __init__(self, browser: Any):
+    def __init__(
+        self,
+        browser: Any,
+        *,
+        bridge_registry: Optional[ChatGPTBridgeRegistry] = None,
+    ):
         self.browser = browser
+        self.bridge_registry = bridge_registry or chatgpt_bridge_registry
 
     @property
     def tab_pool(self):
@@ -124,6 +367,7 @@ class ChatGPTThreadService:
                 "url": thread_url(current_thread_id),
                 "tab_index": int(item.get("persistent_index") or 0) or None,
                 "is_open": True,
+                "is_pinned": False,
             }
 
         sidebar_items = self._read_sidebar_threads(chatgpt_tabs)
@@ -149,6 +393,8 @@ class ChatGPTThreadService:
             result = self.tab_pool.create_shared_url_tab(
                 thread_url(canonical_id),
                 expected_domain=CHATGPT_DOMAIN,
+                background=True,
+                new_window=False,
             )
             if not result.get("ok") or not isinstance(result.get("tab"), dict):
                 error = str(result.get("error") or "create_chatgpt_thread_tab_failed")
@@ -161,6 +407,8 @@ class ChatGPTThreadService:
         result = self.tab_pool.create_shared_url_tab(
             CHATGPT_BASE_URL,
             expected_domain=CHATGPT_DOMAIN,
+            background=True,
+            new_window=False,
         )
         if not result.get("ok") or not isinstance(result.get("tab"), dict):
             error = str(result.get("error") or "create_chatgpt_thread_tab_failed")
@@ -168,6 +416,51 @@ class ChatGPTThreadService:
         tab_info = dict(result["tab"])
         self._require_signed_in(tab_info)
         return tab_info
+
+    def activate_bridge(
+        self,
+        bridge_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        canonical_thread_id = normalize_thread_id(thread_id) if thread_id else None
+        target_url = thread_url(canonical_thread_id) if canonical_thread_id else CHATGPT_BASE_URL
+        tab_info = self.bridge_registry.begin_request(
+            self.tab_pool,
+            bridge_id,
+            target_url,
+            canonical_thread_id,
+        )
+        try:
+            self._require_signed_in(tab_info, expected_thread_id=canonical_thread_id)
+            return tab_info
+        finally:
+            self.bridge_registry.end_request(bridge_id)
+
+    def begin_bridge_request(
+        self,
+        bridge_id: str,
+        thread_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        canonical_thread_id = normalize_thread_id(thread_id) if thread_id else None
+        target_url = thread_url(canonical_thread_id) if canonical_thread_id else CHATGPT_BASE_URL
+        tab_info = self.bridge_registry.begin_request(
+            self.tab_pool,
+            bridge_id,
+            target_url,
+            canonical_thread_id,
+        )
+        try:
+            self._require_signed_in(tab_info, expected_thread_id=canonical_thread_id)
+        except Exception:
+            self.bridge_registry.end_request(bridge_id)
+            raise
+        return tab_info
+
+    def end_bridge_request(self, bridge_id: str) -> None:
+        self.bridge_registry.end_request(bridge_id)
+
+    def release_bridge(self, bridge_id: str) -> bool:
+        return self.bridge_registry.release(self.tab_pool, bridge_id)
 
     def get_thread_for_tab(self, tab_index: int) -> Optional[Dict[str, Any]]:
         target_index = int(tab_index or 0)
